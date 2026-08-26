@@ -1,0 +1,24 @@
+# Per-machine settings. Copy .env.example to local.env; never commit it.
+local.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime state and output, in case anyone points STATE_DIR/LOG_DIR here
+*.log
+*.log.[0-9]
+state.json
+groups.json
+bench-*.json
+
+# Editors and OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
