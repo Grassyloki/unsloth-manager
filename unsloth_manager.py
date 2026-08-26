@@ -212,6 +212,7 @@ STEADY_MIN_SPAN = 0.25    # seconds between first and last chunk
 
 _C_GREEN, _C_YELLOW = tui.C_GREEN, tui.C_YELLOW
 _C_DIM, _C_CYAN = tui.C_DIM, tui.C_CYAN
+_C_RED = tui.C_RED
 
 
 # =============================================================================
@@ -1049,7 +1050,7 @@ def _inference_status(port: int, api_key: str, timeout: float = 10.0) -> dict:
 
 
 def _print_effective(port: int, log_path: str, api_key: str = "",
-                     wait_key: float = 0.0) -> bool:
+                     wait_key: float = 0.0, entry: dict | None = None) -> bool:
     """Print what the server reports it is actually running. False if it could
     not be asked (no key, or the endpoint did not answer).
 
@@ -1102,8 +1103,15 @@ def _print_effective(port: int, log_path: str, api_key: str = "",
     slots = st.get("parallel_slots")
     asked = st.get("requested_parallel_slots")
     if slots is not None:
-        print(f"    slots      : {slots}"
-              + (f"   (asked for {asked})" if asked and asked != slots else ""))
+        line = f"    slots      : {slots}"
+        if asked and asked != slots:
+            line += f"   (asked for {asked})"
+        # Unsloth reports the count but never the occupancy, so this comes
+        # from llama-server's own /slots.
+        usage = _slot_usage(entry) if entry else None
+        if usage:
+            line += f"   —  {usage['busy']} of {usage['total']} busy right now"
+        print(line)
     spec = st.get("speculative_type")
     if spec:
         line = f"    speculative: {spec}"
@@ -2015,7 +2023,8 @@ def cmd_start(args):
             # mode that survived, and the sampling it will apply on its own.
             if not _print_effective(lb.port, log_path,
                                     getattr(args, "api_key", "") or "",
-                                    wait_key=20.0):
+                                    wait_key=20.0,
+                                    entry=state["models"].get(m.repo_id)):
                 print("\n  (could not read back effective settings: no API "
                       "key found in the log)")
             print(f"\n  {m.repo_id} -> {_endpoint_url(lb.port)}\n")
@@ -2195,8 +2204,13 @@ def cmd_status(args):
                   + (f"  ·  variant {e['variant']}" if e.get("variant") else ""))
             if e.get("ctx"):
                 print(f"      context {int(e['ctx']):,} pinned")
-            print(f"      port {e['port']}  pid {e['pid']}  gpus {e.get('gpus', '-')}"
-                  f"  up {_fmt_uptime(float(e.get('started', time.time())))}")
+            line = (f"      port {e['port']}  pid {e['pid']}  "
+                    f"gpus {e.get('gpus', '-')}"
+                    f"  up {_fmt_uptime(float(e.get('started', time.time())))}")
+            usage = _slot_usage(e)
+            if usage:
+                line += f"  sessions {usage['busy']}/{usage['total']}"
+            print(line)
             print(f"      {'ready' if ready else 'loading'}   "
                   f"{_endpoint_url(int(e['port']))}")
             print()
@@ -2744,7 +2758,8 @@ def cmd_settings(args):
         print(f"\n  Running on port {running['port']} — asking the server what "
               f"it actually loaded")
         if not _print_effective(running["port"], running.get("log", ""),
-                                getattr(args, "api_key", "") or ""):
+                                getattr(args, "api_key", "") or "",
+                                entry=running):
             print("    (no API key found in the log; cannot read it back)")
     print()
 
@@ -2968,6 +2983,101 @@ def _tui_act_settings(stdscr):
         model=name, variant=variant, api_key=""))
 
 
+# llama-server's own port, per managed pid. It is chosen at random on every
+# load (and again after every idle-reload), so it is discovered rather than
+# recorded, and cached only briefly.
+_LLAMA_PORT_CACHE: dict[int, tuple[float, int]] = {}
+_SLOT_CACHE: dict[int, tuple[float, tuple[int, int] | None]] = {}
+_LLAMA_PORT_TTL = 30.0
+_SLOT_TTL = 3.0
+
+
+def _llama_server_port(pid: int) -> int:
+    """The port llama-server is listening on beneath a managed server, or 0.
+
+    `unsloth studio run` spawns llama-server as a direct child, so the tracked
+    pid is its parent -- which is what makes this findable without Unsloth
+    telling us. Returns 0 while the model is idle-unloaded: there is no
+    llama-server then, which is not an error.
+    """
+    now = time.monotonic()
+    hit = _LLAMA_PORT_CACHE.get(pid)
+    if hit and now - hit[0] < _LLAMA_PORT_TTL:
+        return hit[1]
+
+    port = 0
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/status") as f:
+                    ppid = 0
+                    for line in f:
+                        if line.startswith("PPid:"):
+                            ppid = int(line.split()[1])
+                            break
+                if ppid != pid:
+                    continue
+                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                    argv = f.read().split(b"\0")
+            except (OSError, ValueError):
+                continue
+            if not argv or b"llama-server" not in argv[0]:
+                continue
+            for i, tok in enumerate(argv):
+                if tok == b"--port" and i + 1 < len(argv):
+                    port = int(argv[i + 1] or 0)
+                    break
+            if port:
+                break
+    except OSError:
+        port = 0
+    _LLAMA_PORT_CACHE[pid] = (now, port)
+    return port
+
+
+def _slot_usage(entry: dict) -> dict | None:
+    """Live slot state: {"busy", "total", "n_ctx"}, or None if unknowable.
+
+    Read from llama-server's own /slots, because nothing above it reports
+    occupancy: Unsloth's status carries the slot COUNT but not how many are in
+    use. None means idle-unloaded, /slots disabled, or the probe failed -- all
+    of which must render as "no answer" rather than as zero busy.
+
+    The context comes back on the same response, and it is worth taking: a
+    server can be reloaded out from under this manager (the Studio UI, a /v1
+    auto-switch, any /api/inference/load), after which what we launched with is
+    no longer what is running.
+    """
+    pid = int(entry.get("pid") or 0)
+    if not pid:
+        return None
+    now = time.monotonic()
+    hit = _SLOT_CACHE.get(pid)
+    if hit and now - hit[0] < _SLOT_TTL:
+        return hit[1]
+
+    usage = None
+    port = _llama_server_port(pid)
+    if port:
+        try:
+            with _http(f"http://127.0.0.1:{port}/slots", timeout=0.6) as r:
+                slots = json.loads(r.read().decode())
+            if isinstance(slots, list) and slots:
+                usage = {
+                    "busy": sum(1 for s in slots if s.get("is_processing")),
+                    "total": len(slots),
+                    "n_ctx": slots[0].get("n_ctx") or 0,
+                }
+        except (urllib.error.URLError, OSError, ValueError):
+            # A stale cached port survives an idle-reload; drop it so the next
+            # call rediscovers rather than retrying a dead one for 30s.
+            _LLAMA_PORT_CACHE.pop(pid, None)
+    _SLOT_CACHE[pid] = (now, usage)
+    return usage
+
+
 _EFFECTIVE_CACHE: dict[tuple, dict] = {}
 
 
@@ -3041,9 +3151,21 @@ def _settings_segments(name: str, entry: dict, terse: bool = False,
         parts[slot] = (text + "  ", attr)
 
     # -- load knobs ----------------------------------------------------------
+    # Live context wins over the remembered one, and says so when they differ:
+    # a reload from the Studio UI or a /v1 auto-switch can change it without
+    # this manager ever hearing about it.
+    usage = _slot_usage(entry)
+    live_ctx = (usage or {}).get("n_ctx") or 0
     ctx = int(eff.get("ctx") or 0)
-    if ctx:
-        add("ctx", f"{ctx // 1024}k" if ctx >= 1024 else str(ctx), hot)
+    drifted = bool(live_ctx and ctx and live_ctx != ctx)
+    shown_ctx = live_ctx or ctx
+
+    def _k(n):
+        return f"{n // 1024}k" if n >= 1024 else str(n)
+
+    if shown_ctx:
+        add("ctx", _k(shown_ctx) + ("!" if drifted else ""),
+            curses.color_pair(_C_RED) if drifted else hot)
     elif "ctx" in eff:
         add("ctx", "fit", cool, notable=False)
 
@@ -3053,8 +3175,16 @@ def _settings_segments(name: str, entry: dict, terse: bool = False,
     elif "kv" in eff:
         add("kv", "kv f16", cool, notable=False)
 
+    # Slots read as "busy/total" when llama-server can be asked. An active
+    # session is always worth showing, so it survives terse mode even when the
+    # slot count itself is unremarkable.
     par = eff.get("parallel")
-    if par:
+    if usage:
+        busy, total = usage["busy"], usage["total"]
+        add("sl", f"{busy}/{total}sl",
+            ok if busy else (hot if total != 4 else cool),
+            notable=bool(busy) or total != 4)
+    elif par:
         add("sl", f"{par}sl", hot if par != 4 else cool, notable=par != 4)
     elif "parallel" in eff:
         add("sl", "4sl", cool, notable=False)
@@ -3104,7 +3234,9 @@ def _settings_segments(name: str, entry: dict, terse: bool = False,
     # Logical order reads best; importance order only earns its keep when the
     # line is going to be cut, so choose by whether it actually fits.
     logical = ("ctx", "kv", "sl", "spec", "tools", "vis", "samp")
-    by_impact = ("tools", "samp", "kv", "sl", "ctx", "spec", "vis")
+    # Sessions rank second: it is the only live fact on the line, and a busy
+    # server is what you most want to know before touching it.
+    by_impact = ("tools", "sl", "samp", "kv", "ctx", "spec", "vis")
     def _group(slot):
         val = parts.get(slot)
         return [] if val is None else (val if isinstance(val, list) else [val])
