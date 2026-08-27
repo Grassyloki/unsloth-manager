@@ -99,9 +99,9 @@ own default is dim; anything this manager changed is bright, so the line
 answers "what am I not running stock?" at a glance:
 
 ```
-  ● Qwen3.6-35B-A3B-MTP-GGUF UD-Q4_K_XL :10001 rdy g0
-      256k  kv q4_0  2sl  mtp  tools ON  no-vis  | T1.0 P0.95 K20 M0.0 pres0.0 rep1.0
-  ● Qwen3.8-27B-GGUF         UD-Q4_K_XL :10002 rdy g1   1/3sl  8 tok/s
+  ● Qwen3.6-35B-A3B-MTP-GGUF UD-Q4_K_XL :10001 rdy g0   0/2sl
+      256k  kv q4_0  mtp  tools ON  no-vis  | T1.0 P0.95 K20 M0.0 pres0.0 rep1.0
+  ● Qwen3.8-27B-GGUF         UD-Q4_K_XL :10002 rdy g1   0/3sl  16 tok/s
       256k  kv q4_0  mtp  tools off  no-vis  warm | T1.0 P0.95 K20 M0.0 pres0.0 rep1.0
 ```
 
@@ -115,8 +115,15 @@ Nothing above `llama-server` reports either: Unsloth's status carries the slot
 *count* but never the occupancy, and no throughput at all. So the manager finds
 `llama-server` — it is a direct child of the pid already tracked — and reads
 its `/slots` and `/metrics`. Both probes share one 3-second cache and a 0.6s
-timeout, so the 5-second redraw never waits on them, and a model that is
-idle-unloaded shows neither figure rather than a misleading zero.
+timeout, so the 5-second redraw never waits on them.
+
+An idle-unloaded model still shows `0/2sl`, because with nothing loaded "no
+sessions" is a fact rather than a guess, and the total is the slot count it
+will come back with. That is deliberately distinct from *not being able to
+tell*: a probe that fails against a live server, or a server started by a
+version that recorded no slot count, shows nothing at all rather than claiming
+zero. Throughput is dropped for an unloaded server too — a rate measured before
+the unload is history, not status.
 
 Throughput is Δtokens ÷ Δgeneration-seconds between probes, from llama.cpp's
 own cumulative counters — the rate it actually decoded at, not an average

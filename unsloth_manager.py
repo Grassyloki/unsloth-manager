@@ -2400,7 +2400,7 @@ def cmd_status(args):
             usage = _slot_usage(e)
             if usage:
                 line += f"  sessions {usage['busy']}/{usage['total']}"
-                if usage.get("tps"):
+                if usage.get("loaded") and usage.get("tps"):
                     line += f"  {usage['tps']:.1f} tok/s"
             if e.get("keep_warm"):
                 line += ("  keep-warm"
@@ -3357,6 +3357,19 @@ def _slot_usage(entry: dict) -> dict | None:
 
     usage = None
     port = _llama_server_port(pid)
+    if not port:
+        # No llama-server means the model is idle-unloaded, and "nothing is
+        # generating" is then a fact rather than a guess -- unlike a probe that
+        # failed against a live server, which stays unknown. The total is what
+        # it was configured with, which is what it will come back with.
+        total = int(entry.get("parallel") or 0)
+        if not total and "parallel" in entry:
+            total = 4                      # `unsloth studio run`'s own default
+        if total:
+            usage = {"busy": 0, "total": total, "n_ctx": 0, "tps": 0.0,
+                     "loaded": False}
+        _SLOT_CACHE[pid] = (now, usage)
+        return usage
     if port:
         try:
             with _http(f"http://127.0.0.1:{port}/slots", timeout=0.6) as r:
@@ -3367,6 +3380,7 @@ def _slot_usage(entry: dict) -> dict | None:
                     "total": len(slots),
                     "n_ctx": slots[0].get("n_ctx") or 0,
                     "tps": 0.0,
+                    "loaded": True,
                 }
                 usage["tps"] = _llama_tps(pid, port)
         except (urllib.error.URLError, OSError, ValueError):
@@ -3814,7 +3828,8 @@ def _tui_main(stdscr):
                     line.append((f"{busy}/{total}sl ".ljust(7),
                                  curses.color_pair(_C_GREEN) if busy
                                  else curses.color_pair(_C_DIM)))
-                    rate = live.get("tps") or 0.0
+                    # A rate from before an idle unload is history, not status.
+                    rate = (live.get("tps") or 0.0) if live.get("loaded") else 0
                     line.append((
                         (f"{rate:.0f} tok/s" if rate else "").ljust(10),
                         curses.color_pair(_C_GREEN) if busy and rate
