@@ -101,22 +101,32 @@ answers "what am I not running stock?" at a glance:
 ```
   ● Qwen3.6-35B-A3B-MTP-GGUF UD-Q4_K_XL :10001 rdy g0
       256k  kv q4_0  2sl  mtp  tools ON  no-vis  | T1.0 P0.95 K20 M0.0 pres0.0 rep1.0
-  ● Qwen3.8-27B-GGUF         UD-Q4_K_XL :10002 rdy g1
-      176k! kv q4_0  1/3sl  mtp  tools off  no-vis | T1.0 P0.95 K20 M0.0 pres0.0 rep1.0
+  ● Qwen3.8-27B-GGUF         UD-Q4_K_XL :10002 rdy g1   1/3sl  8 tok/s
+      256k  kv q4_0  mtp  tools off  no-vis  warm | T1.0 P0.95 K20 M0.0 pres0.0 rep1.0
 ```
 
-`1/3sl` is **sessions: one of three decode slots busy right now**. Occupancy is
-the one thing on the line that is live rather than remembered, so it ranks
-second (after tools) when a narrow terminal has to drop things, and it stays
-visible down to 60 columns. `status` spells it out as `sessions 1/3`, and the
-`settings` readout as `slots : 3 — 1 of 3 busy right now`.
+The first line is what a server *is* — identity, placement, and the two facts
+that change second to second. `1/3sl` is **sessions: one of three decode slots
+busy right now**, and `8 tok/s` its recent decode rate. Everything on the
+second line is configuration, which does not move. `status` spells both out
+(`sessions 1/3  8.0 tok/s`), as does the `settings` readout.
 
-Nothing above `llama-server` reports this: Unsloth's status carries the slot
-*count* but never the occupancy. So the manager finds `llama-server` — it is a
-direct child of the pid already tracked — and reads its `/slots`. That probe is
-cached for 3 seconds and given a 0.6s timeout, so the 5-second redraw never
-waits on it, and a model that is idle-unloaded simply shows no session figure
-rather than a misleading zero.
+Nothing above `llama-server` reports either: Unsloth's status carries the slot
+*count* but never the occupancy, and no throughput at all. So the manager finds
+`llama-server` — it is a direct child of the pid already tracked — and reads
+its `/slots` and `/metrics`. Both probes share one 3-second cache and a 0.6s
+timeout, so the 5-second redraw never waits on them, and a model that is
+idle-unloaded shows neither figure rather than a misleading zero.
+
+Throughput is Δtokens ÷ Δgeneration-seconds between probes, from llama.cpp's
+own cumulative counters — the rate it actually decoded at, not an average
+diluted by idle time. Two details matter. llama.cpp updates those counters when
+a request *completes*, so the number lags a long stream rather than tracking it
+live, and the last real rate is held rather than dropping to zero the moment a
+server goes quiet. And a window must carry at least 5 tokens to count, because
+a keep-warm ping is a one-token generation and would otherwise be what the
+figure reported. On first sight of a server the cumulative counters seed it, so
+a freshly opened screen shows a real number instead of a blank.
 
 The trailing `!` on the context is a **drift flag**, in red: the live context
 from `/slots` disagrees with what this manager launched with. A server can be

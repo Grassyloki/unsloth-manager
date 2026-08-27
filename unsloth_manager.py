@@ -2400,6 +2400,8 @@ def cmd_status(args):
             usage = _slot_usage(e)
             if usage:
                 line += f"  sessions {usage['busy']}/{usage['total']}"
+                if usage.get("tps"):
+                    line += f"  {usage['tps']:.1f} tok/s"
             if e.get("keep_warm"):
                 line += ("  keep-warm"
                          if _pid_alive(int(e.get("keepalive_pid") or 0))
@@ -3266,8 +3268,69 @@ def _llama_server_port(pid: int) -> int:
     return port
 
 
+# Last computed decode rate per server, and the counter sample it came from.
+_TPS_STATE: dict[int, dict] = {}
+
+# A keep-warm ping is a one-token generation, so llama.cpp's own
+# `predicted_tokens_seconds` gauge would end up reporting the ping rather than
+# real traffic. Rates are therefore computed from the cumulative counters over
+# a window, and a window has to carry at least this many tokens to count.
+TPS_MIN_TOKENS = 5
+
+
+def _llama_tps(pid: int, port: int) -> float:
+    """Recent decode rate in tokens/s, or 0 if not yet known.
+
+    Δtokens / Δgeneration-seconds between probes, so it is the rate the server
+    actually decoded at, not an average diluted by idle time. llama.cpp updates
+    these counters when a request completes, so this lags a stream rather than
+    tracking it live -- and the last real rate is held rather than dropping to
+    zero the moment a server goes quiet.
+    """
+    try:
+        with _http(f"http://127.0.0.1:{port}/metrics", timeout=0.6) as r:
+            text = r.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, ValueError):
+        return _TPS_STATE.get(pid, {}).get("rate", 0.0)
+
+    tok = sec = None
+    for line in text.splitlines():
+        if line.startswith("llamacpp:tokens_predicted_total "):
+            tok = _float_or_none(line)
+        elif line.startswith("llamacpp:tokens_predicted_seconds_total "):
+            sec = _float_or_none(line)
+    prev = _TPS_STATE.get(pid)
+    rate = (prev or {}).get("rate", 0.0)
+    if tok is not None and sec is not None:
+        if prev is None:
+            # First look at this server: seed from the cumulative counters so a
+            # freshly opened screen shows a real number instead of a blank for
+            # its first few seconds. Decode-time-weighted, so idle time does
+            # not dilute it, and the window delta refines it from here.
+            if tok >= TPS_MIN_TOKENS and sec > 0:
+                rate = tok / sec
+        else:
+            d_tok = tok - prev["tok"]
+            d_sec = sec - prev["sec"]
+            # A restart resets the counters; a negative delta means this is a
+            # different server behind the same pid, so start over.
+            if d_tok < 0 or d_sec < 0:
+                rate = 0.0
+            elif d_tok >= TPS_MIN_TOKENS and d_sec > 0:
+                rate = d_tok / d_sec
+        _TPS_STATE[pid] = {"tok": tok, "sec": sec, "rate": rate}
+    return rate
+
+
+def _float_or_none(line: str) -> float | None:
+    try:
+        return float(line.split()[1])
+    except (IndexError, ValueError):
+        return None
+
+
 def _slot_usage(entry: dict) -> dict | None:
-    """Live slot state: {"busy", "total", "n_ctx"}, or None if unknowable.
+    """Live server state: {"busy", "total", "n_ctx", "tps"}, or None.
 
     Read from llama-server's own /slots, because nothing above it reports
     occupancy: Unsloth's status carries the slot COUNT but not how many are in
@@ -3278,6 +3341,11 @@ def _slot_usage(entry: dict) -> dict | None:
     server can be reloaded out from under this manager (the Studio UI, a /v1
     auto-switch, any /api/inference/load), after which what we launched with is
     no longer what is running.
+
+    Throughput comes from /metrics on the same trip. llama.cpp updates those
+    counters when a request COMPLETES, not while it streams, so the figure is
+    the decode rate of the last finished request rather than a live one -- and
+    it is 0 until a server has answered something.
     """
     pid = int(entry.get("pid") or 0)
     if not pid:
@@ -3298,7 +3366,9 @@ def _slot_usage(entry: dict) -> dict | None:
                     "busy": sum(1 for s in slots if s.get("is_processing")),
                     "total": len(slots),
                     "n_ctx": slots[0].get("n_ctx") or 0,
+                    "tps": 0.0,
                 }
+                usage["tps"] = _llama_tps(pid, port)
         except (urllib.error.URLError, OSError, ValueError):
             # A stale cached port survives an idle-reload; drop it so the next
             # call rediscovers rather than retrying a dead one for 30s.
@@ -3404,19 +3474,15 @@ def _settings_segments(name: str, entry: dict, terse: bool = False,
     elif "kv" in eff:
         add("kv", "kv f16", cool, notable=False)
 
-    # Slots read as "busy/total" when llama-server can be asked. An active
-    # session is always worth showing, so it survives terse mode even when the
-    # slot count itself is unremarkable.
+    # Occupancy lives on the model line now. What stays here is the CONFIGURED
+    # slot count, and only when it is not Unsloth's default -- and only when
+    # the live figure is not already saying it.
     par = eff.get("parallel")
-    if usage:
-        busy, total = usage["busy"], usage["total"]
-        add("sl", f"{busy}/{total}sl",
-            ok if busy else (hot if total != 4 else cool),
-            notable=bool(busy) or total != 4)
-    elif par:
-        add("sl", f"{par}sl", hot if par != 4 else cool, notable=par != 4)
-    elif "parallel" in eff:
-        add("sl", "4sl", cool, notable=False)
+    if not usage:
+        if par:
+            add("sl", f"{par}sl", hot if par != 4 else cool, notable=par != 4)
+        elif "parallel" in eff:
+            add("sl", "4sl", cool, notable=False)
 
     spec = eff.get("spec") or ""
     if spec and spec != "auto":
@@ -3740,6 +3806,19 @@ def _tui_main(stdscr):
                     (f"g{entry.get('gpus') or '-':<3} ",
                      curses.color_pair(_C_DIM)),
                 ]
+                # Live facts belong with the server's identity, not among the
+                # settings: these change second to second, the rest does not.
+                live = _slot_usage(entry)
+                if live:
+                    busy, total = live["busy"], live["total"]
+                    line.append((f"{busy}/{total}sl ".ljust(7),
+                                 curses.color_pair(_C_GREEN) if busy
+                                 else curses.color_pair(_C_DIM)))
+                    rate = live.get("tps") or 0.0
+                    line.append((
+                        (f"{rate:.0f} tok/s" if rate else "").ljust(10),
+                        curses.color_pair(_C_GREEN) if busy and rate
+                        else curses.color_pair(_C_DIM)))
                 if two_line:
                     header.append(line)
                     header.append([("      ", 0)]
