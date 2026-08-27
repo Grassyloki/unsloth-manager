@@ -40,6 +40,7 @@ CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
 - [Where settings come from](#where-settings-come-from)
 - [Context, and what "max" means](#context-and-what-max-means)
 - [Idle auto-unload, and what a reload restores](#idle-auto-unload-and-what-a-reload-restores)
+- [Keeping a server warm](#keeping-a-server-warm)
 - [Reading settings back after a load](#reading-settings-back-after-a-load)
 - [Instance groups](#instance-groups)
 - [Ports and instance limit](#ports-and-instance-limit)
@@ -143,7 +144,7 @@ Values it cannot establish are omitted rather than defaulted: a server started
 by an older version records less, and printing `kv f16` for one actually
 running `q4_0` would be worse than printing nothing.
 
-Start walks model → **quant** → profile → **server-side tools** → port → GPUs. The quant step matters
+Start walks model → **quant** → profile → **server-side tools** → **idle behaviour** → port → GPUs. The quant step matters
 more than it looks: per-model overrides are keyed `<repo>:<variant>`, so the
 quant decides which saved profile the launch reads. The picker marks the ones
 Unsloth has settings for:
@@ -230,6 +231,7 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | `settings <model>` | All four settings sources side by side, plus live state if it is running. |
 | `presets` | Studio presets from `studio.db`, read-only. |
 | `groups [list\|save\|restore\|show\|clear] [slot]` | Instance groups — see [Instance groups](#instance-groups). |
+| `keepalive <model>` | Ping a server so Studio never idle-unloads it — see [Keeping a server warm](#keeping-a-server-warm). |
 | `logs <model> [-n N] [-f]` | Tail a server log. |
 | `test <model>` | One streaming prompt, with TTFT and tok/s. |
 | `benchmark <model>` | Steady-state tok/s per preset — see [Benchmark](#benchmark). |
@@ -279,6 +281,7 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | Flag | Meaning |
 |---|---|
 | `--tools` / `--no-tools` | Unsloth's server-side web/code tools. Default on — and it serialises `/v1`. |
+| `--keep-warm` / `--no-keep-warm` | Hold this server against Studio's idle unload. Default off. |
 | `--wait N` | Seconds to wait for readiness; `0` returns immediately. Default `LOAD_TIMEOUT`. |
 | `--dry-run` | Print the plan and the command line, start nothing. Touches no state. |
 | `--force` | Start despite a VRAM warning or an instance already running. |
@@ -298,7 +301,8 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | `settings --variant Q` | Which quant's profile to look up (default: best that fits). |
 | `groups --name "..."` | Label for a saved group. |
 | `groups --wait N` | Seconds to wait per model on restore (`0` = don't wait). |
-| `restart --preset` / `--port` / `--gpus` / `--variant` / `--tools` / `--wait` | Change one thing; everything else is kept. |
+| `restart --preset` / `--port` / `--gpus` / `--variant` / `--tools` / `--keep-warm` / `--wait` | Change one thing; everything else is kept. |
+| `keepalive --interval N` / `--api-key` | Ping period (default: half the idle TTL) and token. |
 | `test --api-key` / `benchmark --api-key` / `settings --api-key` | Bearer token. Default: read from the server's own log. |
 
 ### The TUI
@@ -307,7 +311,7 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 
 | Entry | |
 |---|---|
-| **Start Model** | model → quant → profile → tools → port → GPUs, then the launch plan. |
+| **Start Model** | model → quant → profile → tools → idle behaviour → port → GPUs, then the launch plan. |
 | **Instance Groups** | Restore / save / show / clear the ten slots. |
 | **Model Settings** | `settings` for one model. |
 | **Stop Model** | Stop one running server. |
@@ -528,6 +532,24 @@ line rather than nothing at all. `--parallel` is deliberately exempt: it is a
 server-wide startup default, so a reload that omits `n_parallel` still lands on
 the value the manager passed.
 
+The readout also compares what the server reports against what the manager
+launched with, and says so when they disagree — a server can be reloaded out
+from under this tool by the Studio UI, a `/v1` auto-switch, or any
+`POST /api/inference/load`:
+
+```
+WARNING — this is not what the manager launched. Something reloaded it
+          (the Studio UI, a /v1 auto-switch, or any /api/inference/load):
+            context       262,144           ->  180,992
+            kv cache      q4_0              ->  f16 (default)
+            speculative   mtp               ->  ngram
+          `restart` puts it back on the launch settings.
+```
+
+A setting that *disappeared* counts: launching with `q4_0` and finding the
+server on its `f16` default is exactly the case this exists to catch. The home
+screen carries the short version — a red `!` on the context.
+
 When a server is idle-unloaded, the settings readout says that rather than
 reporting empty fields:
 
@@ -535,6 +557,43 @@ reporting empty fields:
 state      : idle-unloaded — Unsloth freed the weights after 5m idle.
              The next /v1 request reloads it; VRAM is free until then.
 ```
+
+## Keeping a server warm
+
+Studio's idle unload is **global**. `openai_api_auto_unload_idle_seconds`,
+`model_memory_keep_resident` and the auto-switch toggle all live in
+`app_settings`, apply to every model in a `STUDIO_HOME`, and none has an
+environment override — so "don't unload *this* one" cannot be expressed through
+Unsloth's settings at all, and this manager does not write to `studio.db`.
+
+It is done from outside instead. `start --keep-warm` (and the TUI's **Idle
+behaviour** step) launches a small detached process that pings that one server
+just often enough that it never goes idle:
+
+```bash
+python unsloth_manager.py start <model> --keep-warm
+python unsloth_manager.py restart <model> --keep-warm
+python unsloth_manager.py keepalive <model>        # run one in the foreground
+```
+
+The interval is half the configured TTL, clamped to 30–600s, so two pings fit
+in every idle window. Only a **POST to an inference path** stamps activity in
+Studio's tracker (`LlamaKeepWarmMiddleware`), so the ping is a real one-token
+completion — with `enable_tools: false`, because otherwise the ping itself
+would serialise `/v1` behind the tool machinery.
+
+The pinger is recorded in the state file and killed by `stop` / `stop-all`
+before the server it was holding: a survivor would keep POSTing at a dead port
+and, with auto-switch on, could even reload the model it was meant to be
+keeping warm. It also exits on its own once the server leaves the state file,
+so it cannot outlive what it was defending. `status` shows `keep-warm`
+(or `keep-warm(DEAD)`), the home screen a green `warm`.
+
+Other models keep getting reclaimed as usual — that is the point of doing it
+per-server rather than turning the global setting off.
+
+Measured here: with the 300s TTL in force, a server held this way ran 10m53s
+with `sessions 0/3` and no unload, its pings landing 150s apart at ~200ms each.
 
 ## Reading settings back after a load
 

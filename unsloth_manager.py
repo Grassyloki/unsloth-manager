@@ -401,6 +401,137 @@ def _next_port(state: dict) -> int:
 
 
 # =============================================================================
+# KEEP WARM
+# =============================================================================
+# Studio frees an idle GGUF and reloads it on the next request, and every lever
+# for that is GLOBAL to a STUDIO_HOME: openai_api_auto_unload_idle_seconds,
+# model_memory_keep_resident, and the auto-switch toggle. None is per-model and
+# none has an environment override, so "keep this one loaded" cannot be
+# expressed through Unsloth's own settings -- and this manager does not write
+# to studio.db.
+#
+# So it is done from outside: a small detached process pings one server just
+# often enough that it never goes idle. Per-server, reversible, and it leaves
+# every other model free to be reclaimed.
+
+# Only a POST to an inference path stamps activity in Studio's idle tracker
+# (LlamaKeepWarmMiddleware), so the ping has to be a real completion. One token
+# is enough and costs nothing measurable.
+KEEPALIVE_MIN_INTERVAL = 30
+KEEPALIVE_MAX_INTERVAL = 600
+KEEPALIVE_FRACTION = 0.5      # of the idle TTL, so two pings fit in every window
+
+
+def _keepalive_interval() -> int:
+    ttl = up.idle_unload_seconds(STUDIO_DB)
+    if not ttl:
+        return 0
+    return max(KEEPALIVE_MIN_INTERVAL,
+               min(KEEPALIVE_MAX_INTERVAL, int(ttl * KEEPALIVE_FRACTION)))
+
+
+def _keepalive_log() -> str:
+    return os.path.join(LOG_DIR, "keepalive.log")
+
+
+def _spawn_keepalive(repo_id: str) -> int:
+    """Start the pinger for one model, detached. Returns its pid, or 0."""
+    interval = _keepalive_interval()
+    if not interval:
+        return 0
+    _ensure_dirs()
+    try:
+        logf = open(_keepalive_log(), "a", buffering=1)
+    except OSError:
+        return 0
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "keepalive", repo_id],
+            stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True)
+    except (OSError, ValueError):
+        return 0
+    finally:
+        logf.close()
+    return proc.pid
+
+
+def _stop_keepalive(entry: dict) -> bool:
+    """Kill a model's pinger if it has one. True if something was stopped."""
+    pid = int(entry.get("keepalive_pid") or 0)
+    if not pid or not _pid_alive(pid):
+        return False
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return False
+    return True
+
+
+def cmd_keepalive(args):
+    """Ping one server often enough that Studio never idles it out.
+
+    Runs in the foreground; `start --keep-warm` spawns it detached. Exits on
+    its own when the server stops, so a stale pinger cannot outlive what it was
+    holding warm.
+    """
+    interval = args.interval or _keepalive_interval()
+    if not interval:
+        _die("idle auto-unload is off in Studio, so nothing needs keeping "
+             "warm.")
+    m = _resolve_model(args.model)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{stamp}] keepalive {m.repo_id} every {interval}s", flush=True)
+
+    while True:
+        entry = _get_running().get(m.repo_id)
+        if not entry:
+            print(f"[{time.strftime('%H:%M:%S')}] {m.repo_id} is no longer "
+                  f"running; keepalive exiting.", flush=True)
+            return
+        port = int(entry["port"])
+        key = args.api_key or API_KEY or _log_api_key(entry.get("log", ""))
+        if not key:
+            print(f"[{time.strftime('%H:%M:%S')}] no API key yet for "
+                  f"{m.repo_id}; retrying.", flush=True)
+        else:
+            try:
+                model_id = _served_model_id_quiet(port, key)
+                if model_id:
+                    body = json.dumps({
+                        "model": model_id,
+                        "messages": [{"role": "user", "content": "ping"}],
+                        "max_tokens": 1,
+                        # Never let a keepalive drag Unsloth's tool machinery
+                        # in: it would serialise /v1 behind this ping.
+                        "enable_tools": False,
+                    }).encode()
+                    with _http(f"http://127.0.0.1:{port}/v1/chat/completions",
+                               method="POST", data=body, api_key=key,
+                               timeout=120):
+                        pass
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                print(f"[{time.strftime('%H:%M:%S')}] ping failed: {e}",
+                      flush=True)
+        time.sleep(interval)
+
+
+def _served_model_id_quiet(port: int, api_key: str) -> str:
+    """_served_model_id without the _die() calls, for the keepalive loop."""
+    try:
+        with _http(f"http://127.0.0.1:{port}/v1/models",
+                   api_key=api_key, timeout=10) as r:
+            data = json.loads(r.read().decode())
+    except (urllib.error.URLError, OSError, ValueError):
+        return ""
+    ids = [m.get("id") for m in data.get("data", []) if m.get("id")]
+    return ids[0] if ids else ""
+
+
+# =============================================================================
 # INSTANCE GROUPS
 # =============================================================================
 # A named snapshot of what is running and exactly how it was launched, so a
@@ -425,6 +556,7 @@ LAUNCH_DEFAULTS: dict = {
     "ctx": None, "parallel": None, "tensor_parallel": None,
     "kv_cache_dtype": None, "spec": None, "spec_draft_n_max": None,
     "vision": None, "n_batch": None, "n_ubatch": None, "extra": None,
+    "keep_warm": False,
     **{k: None for k in up.SAMPLING_FIELDS},
 }
 
@@ -769,6 +901,7 @@ class Launch:
 
     load_source: str = "none"            # override | preset | none
     tools: bool | None = None
+    keep_warm: bool = False
     api_only: bool = True
     extra: list[str] = field(default_factory=list)
     sources: dict = field(default_factory=dict)
@@ -1142,6 +1275,39 @@ def _print_effective(port: int, log_path: str, api_key: str = "",
         vals = {k: inf[k] for k in up.SAMPLING_FIELDS if inf.get(k) is not None}
         print(f"    server's own recommendation: "
               f"{up.fmt_sampling(vals) or 'none'}")
+
+    # A server can be reloaded out from under this manager -- the Studio UI, a
+    # /v1 auto-switch, any POST /api/inference/load. Comparing what it reports
+    # against what we launched with is the only way to notice.
+    if entry:
+        want = _effective_settings(
+            (entry.get("launch_args") or {}).get("model", ""), entry)
+        drift = []
+        # A setting that DISAPPEARED is drift too: launching with q4_0 and
+        # finding the server on its f16 default is exactly the case this
+        # exists to catch, so an absent live value is reported as the default
+        # rather than skipped.
+        for label, live, ours, gone in (
+                ("context", ctx, want.get("ctx") or None, "fit-max"),
+                ("kv cache", st.get("cache_type_kv"), want.get("kv"),
+                 "f16 (default)"),
+                ("speculative", spec, want.get("spec"), "auto"),
+                ("slots", slots, want.get("parallel"), "default")):
+            if ours is None:
+                continue
+            shown = live if live is not None else gone
+            if str(shown) != str(ours):
+                drift.append((label, ours, shown))
+        if drift:
+            print(f"\n    WARNING — this is not what the manager launched. "
+                  f"Something reloaded it\n              (the Studio UI, a "
+                  f"/v1 auto-switch, or any /api/inference/load):")
+            for label, ours, live in drift:
+                a = f"{ours:,}" if isinstance(ours, int) else str(ours)
+                b = f"{live:,}" if isinstance(live, int) else str(live)
+                print(f"                {label:<14}{a:<18}->  {b}")
+            print(f"              `restart` puts it back on the launch "
+                  f"settings.")
     return True
 
 
@@ -1388,6 +1554,7 @@ def _resolve_launch(m: ml.ModelInfo, args) -> Launch:
         lb.sources["vision"] = "flag"
     if getattr(args, "tools", None) is not None:
         lb.tools = args.tools
+    lb.keep_warm = bool(getattr(args, "keep_warm", False))
     gpus = (getattr(args, "gpus", "") or "").strip()
     if gpus:
         lb.gpus = gpus
@@ -1987,6 +2154,7 @@ def cmd_start(args):
         # restart cannot silently turn tools back on for a server started
         # without them.
         "tools": lb.tools,
+        "keep_warm": lb.keep_warm,
         # Every answer this launch was given, so an instance group can replay
         # it verbatim. Stored as inputs, not as the settings they resolved to.
         "launch_args": _launch_args(args),
@@ -2027,6 +2195,20 @@ def cmd_start(args):
                                     entry=state["models"].get(m.repo_id)):
                 print("\n  (could not read back effective settings: no API "
                       "key found in the log)")
+            if lb.keep_warm:
+                kp = _spawn_keepalive(m.repo_id)
+                if kp:
+                    st, _ = _prune_dead(_load_state())
+                    if m.repo_id in st["models"]:
+                        st["models"][m.repo_id]["keepalive_pid"] = kp
+                        _save_state(st)
+                    print(f"\n  keep-warm : pinging every "
+                          f"{_keepalive_interval()}s (pid {kp}) so Studio's "
+                          f"{up.idle_unload_seconds(STUDIO_DB)}s idle unload "
+                          f"never fires")
+                else:
+                    print("\n  keep-warm : not started — Studio's idle "
+                          "auto-unload is already off")
             print(f"\n  {m.repo_id} -> {_endpoint_url(lb.port)}\n")
             return
         time.sleep(2)
@@ -2110,6 +2292,11 @@ def cmd_stop(args):
 
     e = state["models"][key]
     print(f"\n  Stopping {key} (pid {e['pid']}, port {e['port']}) ...")
+    # Before the server: a pinger left running would keep POSTing at a dead
+    # port, and with auto-switch on it could even reload the model it was
+    # meant to be holding warm.
+    if _stop_keepalive(e):
+        print("    keep-warm pinger stopped.")
     ok = _signal_and_wait(key, int(e["pid"]), STOP_TIMEOUT_SEC)
 
     state["models"].pop(key, None)
@@ -2155,6 +2342,7 @@ def cmd_restart(args):
                 sampling=getattr(args, "sampling", None),
                 mode=getattr(args, "mode", None),
                 tools=getattr(args, "tools", None),
+                keep_warm=getattr(args, "keep_warm", None),
                 load_profile=getattr(args, "load_profile", None))
     if key in running:
         e = running[key]
@@ -2172,6 +2360,8 @@ def cmd_restart(args):
         # tools is carried forward on presence, not on truth.
         if plan["tools"] is None:
             plan["tools"] = e.get("tools")
+        if plan["keep_warm"] is None:
+            plan["keep_warm"] = e.get("keep_warm")
         cmd_stop(argparse.Namespace(model=key))
         time.sleep(1.5)
 
@@ -2180,7 +2370,7 @@ def cmd_restart(args):
         sampling=plan["sampling"] or "docs",
         mode=plan["mode"] or up.DEFAULT_DOC_MODE,
         load_profile=plan["load_profile"] or "auto",
-        tools=plan["tools"],
+        tools=plan["tools"], keep_warm=bool(plan["keep_warm"]),
         preset=plan["preset"], port=plan["port"], gpus=plan["gpus"],
         variant=plan["variant"]))
 
@@ -2210,6 +2400,10 @@ def cmd_status(args):
             usage = _slot_usage(e)
             if usage:
                 line += f"  sessions {usage['busy']}/{usage['total']}"
+            if e.get("keep_warm"):
+                line += ("  keep-warm"
+                         if _pid_alive(int(e.get("keepalive_pid") or 0))
+                         else "  keep-warm(DEAD)")
             print(line)
             print(f"      {'ready' if ready else 'loading'}   "
                   f"{_endpoint_url(int(e['port']))}")
@@ -2892,6 +3086,37 @@ def _tui_pick_tools(stdscr, repo_id: str, variant: str, load_profile: str,
     return idx == 1
 
 
+def _tui_pick_keep_warm(stdscr):
+    """Keep this server loaded, or let Studio reclaim it. None on cancel."""
+    import curses
+    ttl = up.idle_unload_seconds(STUDIO_DB)
+    if not ttl:
+        return False                    # nothing to defend against
+    mins = f"{ttl // 60}m" if ttl % 60 == 0 else f"{ttl}s"
+    dim = curses.color_pair(_C_DIM)
+    header = [
+        (f"Studio frees an idle model after {mins} and reloads it on the next "
+         f"request.", curses.color_pair(_C_YELLOW) | curses.A_BOLD),
+        ("That costs a reload, and the reload is rebuilt from studio.db —",
+         dim),
+        ("so it can come back on different settings than it left on.", dim),
+        ("", 0),
+        ("Unsloth has no per-model setting for this, so keeping one warm",
+         dim),
+        (f"means pinging it here every {_keepalive_interval()}s. Other models "
+         f"still get reclaimed.", dim),
+    ]
+    items = [
+        ("  Let it unload when idle  (frees VRAM for other models)", 0),
+        ("  Keep it warm — never let it idle out",
+         curses.color_pair(_C_GREEN)),
+    ]
+    idx = tui.select(stdscr, "Idle behaviour", items, header=header)
+    if idx < 0:
+        return None
+    return idx == 1
+
+
 def _tui_pick_preset(stdscr):
     """Choose a Studio preset, or none. Returns "none" to opt out, or None on cancel."""
     presets = up.load_presets(STUDIO_DB)
@@ -2963,12 +3188,16 @@ def _tui_act_start(stdscr):
     tools = _tui_pick_tools(stdscr, name, variant, load, preset)
     if tools is None:
         return
+    keep_warm = _tui_pick_keep_warm(stdscr)
+    if keep_warm is None:
+        return
     port_s = tui.text(stdscr, f"Port (blank = auto, {PORT_POOL_LABEL}): ")
     port = int(port_s) if port_s.isdigit() else None
     gpus = tui.text(stdscr, "GPUs, e.g. 0 or 0,1 (blank = profile / auto): ")
     tui.run_cmd(stdscr, cmd_start, argparse.Namespace(
         model=name, preset=preset, port=port, gpus=gpus, variant=variant,
         load_profile=load, sampling=sampling, mode=mode, tools=tools,
+        keep_warm=keep_warm,
         api_key="", dry_run=False, wait=None, force=False))
 
 
@@ -3203,6 +3432,13 @@ def _settings_segments(name: str, entry: dict, terse: bool = False,
     if eff.get("vision") is False:
         add("vis", "no-vis", hot)
 
+    # Live, like the session count: a pinger that died should stop claiming
+    # the server is being held warm.
+    if entry.get("keep_warm"):
+        alive = _pid_alive(int(entry.get("keepalive_pid") or 0))
+        add("warm", "warm" if alive else "warm?",
+            ok if alive else curses.color_pair(_C_RED))
+
     # -- sampling ------------------------------------------------------------
     if "pinned" in eff:
         pinned = eff.get("pinned") or {}
@@ -3233,10 +3469,10 @@ def _settings_segments(name: str, entry: dict, terse: bool = False,
     # the sampling pins change what the model writes.
     # Logical order reads best; importance order only earns its keep when the
     # line is going to be cut, so choose by whether it actually fits.
-    logical = ("ctx", "kv", "sl", "spec", "tools", "vis", "samp")
+    logical = ("ctx", "kv", "sl", "spec", "tools", "vis", "warm", "samp")
     # Sessions rank second: it is the only live fact on the line, and a busy
     # server is what you most want to know before touching it.
-    by_impact = ("tools", "sl", "samp", "kv", "ctx", "spec", "vis")
+    by_impact = ("tools", "sl", "warm", "samp", "kv", "ctx", "spec", "vis")
     def _group(slot):
         val = parts.get(slot)
         return [] if val is None else (val if isinstance(val, list) else [val])
@@ -3599,6 +3835,16 @@ Override with --api-key or UNSLOTH_MGR_API_KEY.
     sp = sub.add_parser("presets", help="Unsloth Studio presets from studio.db")
     sp.set_defaults(func=cmd_presets)
 
+    sp = sub.add_parser("keepalive",
+                        help="ping a server so it is never idle-unloaded")
+    sp.add_argument("model")
+    sp.add_argument("--interval", type=int,
+                    help="seconds between pings (default: half Studio's idle "
+                         "timeout)")
+    sp.add_argument("--api-key", default="",
+                    help="bearer token (default: from the server log)")
+    sp.set_defaults(func=cmd_keepalive)
+
     sp = sub.add_parser("groups",
                         help="save/restore a named set of running servers")
     sp.add_argument("action", nargs="?", default="list",
@@ -3686,6 +3932,10 @@ Override with --api-key or UNSLOTH_MGR_API_KEY.
     sp.add_argument("--tools", action=argparse.BooleanOptionalAction,
                     default=None,
                     help="Unsloth's server-side web/code tools (default: on)")
+    sp.add_argument("--keep-warm", dest="keep_warm",
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help="ping this server so Studio's idle auto-unload never "
+                         "frees it (default: off)")
     sp.add_argument("--extra", action="append", metavar="ARG",
                     help="repeatable raw llama-server arg, e.g. --extra=-ngl "
                          "--extra=99")
@@ -3719,6 +3969,9 @@ Override with --api-key or UNSLOTH_MGR_API_KEY.
                     default=None,
                     help="server-side tools (default: keep what it was "
                          "started with)")
+    sp.add_argument("--keep-warm", dest="keep_warm",
+                    action=argparse.BooleanOptionalAction, default=None,
+                    help="keep-warm pinger (default: keep)")
     sp.add_argument("--wait", type=int,
                     help="seconds to wait for readiness (0 = don't wait)")
     sp.set_defaults(func=cmd_restart)
