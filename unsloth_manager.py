@@ -34,6 +34,7 @@ readout pick it up. Override with --api-key or UNSLOTH_MGR_API_KEY.
 from __future__ import annotations
 
 import argparse
+import datetime
 import grp
 import json
 import os
@@ -499,7 +500,7 @@ def cmd_keepalive(args):
                   f"{m.repo_id}; retrying.", flush=True)
         else:
             try:
-                model_id = _served_model_id_quiet(port, key)
+                model_id = _served_model_id_quiet(port, key, m.repo_id)
                 if model_id:
                     body = json.dumps({
                         "model": model_id,
@@ -519,7 +520,7 @@ def cmd_keepalive(args):
         time.sleep(interval)
 
 
-def _served_model_id_quiet(port: int, api_key: str) -> str:
+def _served_model_id_quiet(port: int, api_key: str, repo_id: str = "") -> str:
     """_served_model_id without the _die() calls, for the keepalive loop."""
     try:
         with _http(f"http://127.0.0.1:{port}/v1/models",
@@ -527,8 +528,8 @@ def _served_model_id_quiet(port: int, api_key: str) -> str:
             data = json.loads(r.read().decode())
     except (urllib.error.URLError, OSError, ValueError):
         return ""
-    ids = [m.get("id") for m in data.get("data", []) if m.get("id")]
-    return ids[0] if ids else ""
+    hit = _pick_served_model(data.get("data", []), repo_id)
+    return (hit or {}).get("id", "")
 
 
 # =============================================================================
@@ -653,13 +654,22 @@ def _read_studio_pid(port: int) -> int:
 _gpu_cache: list[dict] = []
 
 
+def _smi_num(s: str) -> float | None:
+    """A numeric nvidia-smi field, or None for "[N/A]" / "[Not Supported]"."""
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def _query_gpus(timeout: float = 6.0) -> list[dict]:
     if not _has_command("nvidia-smi"):
         return []
     try:
         out = subprocess.run(
             ["nvidia-smi",
-             "--query-gpu=index,name,memory.total,memory.used",
+             "--query-gpu=index,name,memory.total,memory.used,"
+             "utilization.gpu,temperature.gpu,power.draw,power.limit",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=timeout).stdout
     except (subprocess.SubprocessError, OSError):
@@ -668,7 +678,7 @@ def _query_gpus(timeout: float = 6.0) -> list[dict]:
     gpus = []
     for line in out.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 4:
+        if len(parts) < 8:
             continue
         try:
             gpus.append({
@@ -676,6 +686,11 @@ def _query_gpus(timeout: float = 6.0) -> list[dict]:
                 "name": parts[1],
                 "total_mb": int(parts[2]),
                 "used_mb": int(parts[3]),
+                # Live sensors; any of them may be unsupported on a given card.
+                "util_pct": _smi_num(parts[4]),
+                "temp_c": _smi_num(parts[5]),
+                "power_w": _smi_num(parts[6]),
+                "power_limit_w": _smi_num(parts[7]),
             })
         except ValueError:
             continue
@@ -712,17 +727,19 @@ def _managed_pids() -> set[int]:
     return pids
 
 
-def _gpu_usage_split(timeout: float = 6.0) -> list[dict]:
+def _gpu_usage_split(timeout: float = 6.0,
+                     pids: set[int] | None = None) -> list[dict]:
     """Per-GPU memory split into 'ours' vs 'other', for the TUI bars.
 
     nvidia-smi reports compute-apps per GPU; anything whose pid sits in a
-    process group we launched counts as ours.
+    process group we launched counts as ours. `pids` narrows "ours" to those
+    servers alone, for attributing memory to one of several.
     """
     gpus = _gpus(refresh=True)
     if not gpus:
         return []
 
-    ours = _managed_pids()
+    ours = set(pids) if pids is not None else _managed_pids()
     our_pgids = set()
     for pid in ours:
         try:
@@ -777,10 +794,7 @@ def _gpu_usage_split(timeout: float = 6.0) -> list[dict]:
     for g in gpus:
         mine = min(per_gpu_ours.get(g["index"], 0), g["used_mb"])
         split.append({
-            "index": g["index"],
-            "name": g["name"],
-            "total_mb": g["total_mb"],
-            "used_mb": g["used_mb"],
+            **g,
             "ours_mb": mine,
             "other_mb": max(0, g["used_mb"] - mine),
         })
@@ -817,20 +831,80 @@ def _stacked_bar(segvals, total, width=20):
     return out
 
 
+def _level_color(pct):
+    """btop's meter gradient in three steps: green, then yellow, then red."""
+    return _C_GREEN if pct < 50 else _C_YELLOW if pct < 80 else _C_RED
+
+
+def _meter(pct, width=8):
+    """[(chars, attr_key), ...] for a btop-style meter.
+
+    Each cell takes the colour of the level it stands for rather than of the
+    current reading, so a full meter runs green into red like btop's does.
+    """
+    if pct is None:
+        return [("·" * width, _C_DIM)]
+    filled = int(round(width * max(0.0, min(100.0, pct)) / 100))
+    out = []
+    for i in range(width):
+        key = _level_color(100 * (i + 0.5) / width) if i < filled else _C_DIM
+        char = "■" if i < filled else "·"
+        if out and out[-1][1] == key:
+            out[-1] = (out[-1][0] + char, key)
+        else:
+            out.append((char, key))
+    return out
+
+
+def _temp_color(c):
+    # V100/A100-class cards start slowing down in the high 80s.
+    return _C_GREEN if c < 70 else _C_YELLOW if c < 85 else _C_RED
+
+
 def _gpu_bar_line(g, width=20):
     import curses
+    dim = curses.color_pair(_C_DIM)
     segs = _stacked_bar(
         [(g["ours_mb"], _C_GREEN), (g["other_mb"], _C_YELLOW)],
         g["total_mb"], width)
     line = [("  ", 0),
             (f"GPU{g['index']} ", curses.A_BOLD),
-            ("[", curses.color_pair(_C_DIM))]
+            ("[", dim)]
     for text, attr in segs:
         line.append((text, curses.color_pair(attr)))
-    line.append(("] ", curses.color_pair(_C_DIM)))
-    line.append((f"{g['used_mb'] // 1024}/{g['total_mb'] // 1024}G ",
-                 curses.color_pair(_C_DIM)))
-    line.append((g["name"][:22], curses.color_pair(_C_DIM)))
+    line.append(("] ", dim))
+    line.append((f"{g['used_mb'] // 1024}/{g['total_mb'] // 1024}G".ljust(7),
+                 dim))
+
+    # Compute, temperature and power, laid out the way btop's GPU box does.
+    util = g.get("util_pct")
+    line.append(("  use ", dim))
+    for text, key in _meter(util):
+        line.append((text, curses.color_pair(key)))
+    line.append(((f" {util:.0f}%" if util is not None else " -").ljust(5),
+                 curses.color_pair(_level_color(util)) if util else dim))
+
+    temp = g.get("temp_c")
+    line.append(((f" {temp:.0f}°C" if temp is not None else " -").ljust(6),
+                 curses.color_pair(_temp_color(temp)) if temp is not None
+                 else dim))
+
+    power, limit = g.get("power_w"), g.get("power_limit_w")
+    line.append(("  pwr ", dim))
+    ppct = 100 * power / limit if power is not None and limit else None
+    for text, key in _meter(ppct):
+        line.append((text, curses.color_pair(key)))
+    if power is None:
+        watts = " -"
+    elif limit:
+        watts = f" {power:.0f}/{limit:.0f}W"
+    else:
+        watts = f" {power:.0f}W"
+    line.append((watts.ljust(10),
+                 curses.color_pair(_level_color(ppct)) if ppct is not None
+                 else dim))
+
+    line.append((" " + g["name"][:22], dim))
     return line
 
 
@@ -1311,12 +1385,37 @@ def _print_effective(port: int, log_path: str, api_key: str = "",
     return True
 
 
-def _served_model_id(port: int, api_key: str) -> str:
-    """Ask the server what it calls the loaded model.
+def _pick_served_model(models: list, repo_id: str = "") -> dict | None:
+    """The /v1/models entry a request to this server should name.
 
-    Unsloth serves a sanitised alias, not the repo id or the .gguf path, so the
-    id has to come from /v1/models rather than being guessed.
+    Studio lists every model it could serve there, not just its own -- and a
+    request naming any of them makes Studio swap that model in. So the first
+    entry is not "the model": on an idle-unloaded server it can be some other
+    cached one, and asking for it loads that instead. With a repo id, only
+    that model's entry will do (None if it is not listed); without one, the
+    loaded model, then the first.
     """
+    models = [e for e in models if isinstance(e, dict) and e.get("id")]
+    if repo_id:
+        want = repo_id.lower()
+        base = want.rsplit("/", 1)[-1]
+        for e in models:
+            if e["id"].lower() == want:
+                return e
+        for e in models:
+            # An alias rather than the repo id, as older Studio builds served.
+            if (e["id"].lower().rsplit("/", 1)[-1] == base
+                    or str(e.get("display_name") or "").lower() == base):
+                return e
+        return None
+    for e in models:
+        if e.get("loaded"):
+            return e
+    return models[0] if models else None
+
+
+def _served_models(port: int, api_key: str) -> list:
+    """GET /v1/models, or exit saying why not."""
     try:
         with _http(f"http://127.0.0.1:{port}/v1/models",
                    api_key=api_key, timeout=10) as r:
@@ -1328,11 +1427,23 @@ def _served_model_id(port: int, api_key: str) -> str:
         _die(f"GET /v1/models failed: HTTP {e.code}")
     except (urllib.error.URLError, OSError, ValueError) as e:
         _die(f"GET /v1/models failed: {e}")
-
-    ids = [m.get("id") for m in data.get("data", []) if m.get("id")]
-    if not ids:
+    models = [e for e in data.get("data", []) if isinstance(e, dict) and e.get("id")]
+    if not models:
         _die("server reported no models on /v1/models")
-    return ids[0]
+    return models
+
+
+def _served_model_id(port: int, api_key: str, repo_id: str = "") -> str:
+    """Ask the server what it calls a model -- `repo_id`'s, when given.
+
+    The id has to come from /v1/models rather than being guessed, and has to
+    be the right entry of it: see _pick_served_model.
+    """
+    hit = _pick_served_model(_served_models(port, api_key), repo_id)
+    if hit is None:
+        _die(f"the server on port {port} does not list {repo_id} on "
+             f"/v1/models, so there is no id to ask it for")
+    return hit["id"]
 
 
 # =============================================================================
@@ -1991,6 +2102,11 @@ def cmd_list(args):
 
     running = _get_running()
     per_gpu, n_gpus = _per_gpu_vram_gb(), _n_gpus()
+    # Bring the live servers' figures up to date first; every other model's
+    # are whatever it last banked before it was stopped.
+    for name, e in running.items():
+        _tokens_sample(name, e)
+    tokens = _load_tokens()["models"]
 
     print(f"\n  Models in {ml.hub_dir(HF_HOME)}\n")
     for m in models:
@@ -2017,6 +2133,16 @@ def cmd_list(args):
             print(f"      running: port {e['port']} "
                   f"[{_profile_label(e)}] "
                   f"{state}  {_endpoint_url(e['port'])}")
+
+        tk = tokens.get(m.repo_id)
+        if tk and (tk.get("in") or tk.get("out")):
+            note = (f"      tokens:  ↑{_fmt_tokens(tk['in'])} in "
+                    f"↓{_fmt_tokens(tk['out'])} out all-time")
+            run = tk.get("run_in") or tk.get("run_out")
+            if run and m.repo_id in running:
+                note += ("    this run "
+                         + _fmt_token_pair(tk["run_in"], tk["run_out"]))
+            print(note)
     print()
     if not args.variants:
         print("  (--variants to list GGUF quants and their VRAM fit)\n")
@@ -2297,6 +2423,9 @@ def cmd_stop(args):
     # meant to be holding warm.
     if _stop_keepalive(e):
         print("    keep-warm pinger stopped.")
+    # The server's counters die with it, so bank what it has done while it can
+    # still be asked -- otherwise everything since the last poll is lost.
+    _tokens_sample(key, e)
     ok = _signal_and_wait(key, int(e["pid"]), STOP_TIMEOUT_SEC)
 
     state["models"].pop(key, None)
@@ -2402,24 +2531,54 @@ def cmd_status(args):
                 line += f"  sessions {usage['busy']}/{usage['total']}"
                 if usage.get("loaded") and usage.get("tps"):
                     line += f"  {usage['tps']:.1f} tok/s"
+            lt = _load_timing(e)
+            if lt and lt["loading_since"] is not None:
+                line += (f"  loading "
+                         f"{_fmt_secs(max(0.0, time.time() - lt['loading_since']))}")
+            elif lt and lt["secs"] is not None:
+                line += (f"  last load {_fmt_secs(lt['secs'])}"
+                         + (" (idle reload)" if lt["after_idle"] else ""))
             if e.get("keep_warm"):
                 line += ("  keep-warm"
                          if _pid_alive(int(e.get("keepalive_pid") or 0))
                          else "  keep-warm(DEAD)")
             print(line)
+            tk = _tokens_sample(name, e)
+            print(f"      tokens  this run ↑{tk['run_in']:,} in "
+                  f"↓{tk['run_out']:,} out   ·   all-time "
+                  f"↑{tk['in']:,} in ↓{tk['out']:,} out")
             print(f"      {'ready' if ready else 'loading'}   "
                   f"{_endpoint_url(int(e['port']))}")
             print()
 
+    doc = _load_tokens()
+    tin, tout = _tokens_totals(doc)
+    if tin or tout:
+        idle = [n for n in doc["models"] if n not in running]
+        print(f"  Tokens, all-time: ↑{tin:,} in · ↓{tout:,} out "
+              f"across {len(doc['models'])} model(s)"
+              + (f", {len(idle)} not running" if idle else ""))
+        print()
+
     gsplit = _gpu_usage_split()
     if gsplit:
-        print("  GPU memory")
+        print("  GPUs")
         for g in gsplit:
             pct = 100 * g["used_mb"] // max(1, g["total_mb"])
+            live = []
+            if g.get("util_pct") is not None:
+                live.append(f"use {g['util_pct']:.0f}%")
+            if g.get("temp_c") is not None:
+                live.append(f"{g['temp_c']:.0f}°C")
+            if g.get("power_w") is not None:
+                live.append(f"{g['power_w']:.0f}"
+                            + (f"/{g['power_limit_w']:.0f}"
+                               if g.get("power_limit_w") else "") + "W")
             print(f"    GPU{g['index']} {g['name'][:24]:<24} "
                   f"{g['used_mb'] // 1024:>2}/{g['total_mb'] // 1024:>2}G "
                   f"({pct:>3}%)  ours {g['ours_mb'] // 1024}G  "
-                  f"other {g['other_mb'] // 1024}G")
+                  f"other {g['other_mb'] // 1024}G"
+                  + ("   " + "  ".join(live) if live else ""))
 
     tot, avail = _read_mem_gb()
     if tot:
@@ -2457,6 +2616,10 @@ def _stream_completion(port: int, model_id: str, api_key: str, prompt: str,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "stream": True,
+        # Measure the model, not Unsloth's tool layer: with tools on, the
+        # model may stop to run web searches mid-answer, which puts network
+        # round-trips into TTFT and serialises /v1 behind this request.
+        "enable_tools": False,
     }).encode()
 
     start = time.monotonic()
@@ -2555,7 +2718,7 @@ def cmd_test(args):
                         log_path=running[key].get("log", "")):
         _die(f"server on port {port} is not ready yet")
 
-    model_id = _served_model_id(port, api_key)
+    model_id = _served_model_id(port, api_key, key)
     prompt = args.prompt or TEST_PROMPT
 
     print(f"\n  {key}  (served as {model_id})")
@@ -2586,29 +2749,337 @@ def cmd_test(args):
           f"steady {steady_s}   mean {mean:.1f} tok/s\n")
 
 
-def cmd_benchmark(args):
-    """Load each (model, preset), measure steady-state tok/s, then stop it."""
-    _ensure_dirs()
-    m = _resolve_model(args.model)
-    api_key = _resolve_api_key(args.api_key)
+_LOG_REQUEST_RE = re.compile(
+    rb'"event": "request_completed", "method": "POST", '
+    rb'"path": "/(?:v1|api/inference)/')
 
+
+def _log_size(path: str) -> int:
+    try:
+        return os.path.getsize(path) if path else 0
+    except OSError:
+        return 0
+
+
+def _bench_log_window(path: str, offset: int) -> tuple[int | None, int]:
+    """What else a server did since `offset` in its log, around one request.
+
+    Returns (other requests completed, llama-server starts). The first is
+    None when the log cannot say -- no log, or our own request never showed.
+
+    This is the only view that sees everything. llama-server's /slots shows
+    requests decoding at that instant, but not one queued behind Unsloth's
+    tool layer, nor one waiting on a model switch -- and a client asking this
+    server for another model makes Studio unload ours, load theirs, and load
+    ours back, which can cost a run a minute while /slots reports it idle.
+    """
+    if not path:
+        return None, 0
+    # Our own completion line is written just after the stream ends; give it
+    # a moment, so it is not missed here and miscounted in the next window.
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            with open(path, "rb") as f:
+                f.seek(offset)
+                chunk = f.read()
+        except OSError:
+            return None, 0
+        done = len(_LOG_REQUEST_RE.findall(chunk))
+        if done or time.monotonic() >= deadline:
+            break
+        time.sleep(0.2)
+    loads = chunk.count(b'"event": "Starting llama-server')
+    return (done - 1 if done else None), loads
+
+
+def _bench_measure(entry: dict, repo_id: str, api_key: str, max_tokens: int,
+                   live: bool = False) -> dict:
+    """A warm-up plus BENCH_RUNS measured generations against one server.
+
+    Returns the metrics for a results row. Raises what _stream_completion
+    raises, and exits (SystemExit) if /v1/models refuses the key or does not
+    list the model.
+
+    Every measured run is checked against the server log for anything else
+    that happened during it -- other requests, or a model load -- and a run
+    that shared the server is counted and flagged, never silently averaged in.
+
+    `live` is a server this benchmark did not start, which may not have its
+    model loaded: idle-unloaded, or swapped out by a client that asked it for
+    another. The warm-up then brings it back, so that request gets the load
+    timeout rather than the stall one, and its wait is reported as the reload.
+    """
+    port = int(entry["port"])
+    pid = int(entry.get("pid") or 0)
+    log = entry.get("log", "")
+    models = _served_models(port, api_key)
+    mine = _pick_served_model(models, repo_id)
+    if mine is None:
+        _die(f"the server on port {port} does not list {repo_id} on "
+             f"/v1/models, so there is no id to ask it for")
+    model_id = mine["id"]
+
+    # Studio reports "loaded" per entry. An older build that does not is
+    # treated as loaded: a reload is then only visible in the log.
+    unloaded = live and mine.get("loaded") is False
+    if unloaded:
+        other = next((e["id"] for e in models
+                      if e.get("loaded") and e is not mine), "")
+        if other:
+            print(f"    serving {other} right now (a client switched it): the "
+                  f"warm-up swaps\n    {repo_id} back in, which interrupts "
+                  f"that model's users, and is timed as the reload")
+        else:
+            print("    idle-unloaded: the warm-up reloads it, and is timed "
+                  "as the reload")
+        # Studio rebuilds a reload from studio.db, not from our command line.
+        for field, ours, theirs in _bench_reload_drift(repo_id, entry):
+            print(f"    the reload restores {field} {theirs}, not the "
+                  f"{ours} it was launched with")
+
+    reload_secs = None
+    for i in range(BENCH_WARMUP):
+        res = _stream_completion(
+            port, model_id, api_key, BENCH_PROMPT, 64,
+            max(BENCH_FREEZE_TIMEOUT, LOAD_TIMEOUT_SEC) if unloaded and i == 0
+            else BENCH_FREEZE_TIMEOUT)
+        if unloaded and i == 0:
+            reload_secs = res["ttft"]
+            print(f"    reloaded in {_fmt_secs(reload_secs)}")
+
+    runs = []
+    shared = 0
+    unknown = False
+    for i in range(BENCH_RUNS):
+        mark = _log_size(log)
+        # Distinct prompts so prefix caching cannot collapse the runs.
+        prompt = f"{BENCH_PROMPT} (variation {i + 1})"
+        res = _stream_completion(port, model_id, api_key, prompt,
+                                 max_tokens, BENCH_FREEZE_TIMEOUT)
+        runs.append(res)
+        others, loads = _bench_log_window(log, mark)
+        notes = []
+        if others:
+            notes.append(f"{others} other request(s) ran alongside")
+        if loads:
+            notes.append("a model load ran during it")
+        if notes:
+            shared += 1
+        elif others is None:
+            unknown = True
+        s = _steady_tps(res["token_times"], BENCH_WINDOW)
+        print(f"    run {i + 1}: {len(res['token_times'])} chunks  "
+              + (f"steady {s:.1f} tok/s" if s else "steady n/a (too short)")
+              + (f"  TTFT {res['ttft']:.1f}s  [{'; '.join(notes)}]"
+                 if notes else ""))
+
+    # Attributed to this server's own process group, not to everything the
+    # manager runs: other instances may share the GPUs.
+    peak = [g["ours_mb"] for g in _gpu_usage_split(pids={pid} if pid else None)]
+    return {
+        "served_as": model_id,
+        "steady_tps": round(max(_steady_tps(r["token_times"], BENCH_WINDOW)
+                                for r in runs), 2),
+        "mean_tps": round(sum(len(r["token_times"]) for r in runs) / max(
+            1e-9, sum(r["total"] for r in runs)), 2),
+        "ttft": round(sum(r["ttft"] for r in runs) / len(runs), 3),
+        # Streamed content pieces, not tokenizer tokens: the SSE deltas are
+        # what we can actually time.
+        "chunks": sum(len(r["token_times"]) for r in runs),
+        "stalls": sum(r["stalls"] for r in runs),
+        "peak_vram_mb": peak,
+        "reload_secs": (round(reload_secs, 1)
+                        if reload_secs is not None else None),
+        # None when the log could not say: "nobody else was on it" is a claim.
+        "shared_runs": None if unknown and not shared else shared,
+    }
+
+
+def _bench_live_settings(name: str, entry: dict) -> dict:
+    """What a running server is configured with, recorded beside its numbers.
+
+    A live benchmark measures whatever that server is running, which no flag
+    of this command chose -- so the result has to carry it, or the numbers
+    cannot be compared with anything later.
+    """
+    eff = _effective_settings(name, entry)
+    usage = _slot_usage(entry) or {}
+    out = {"profile": _profile_label(entry),
+           "variant": entry.get("variant") or "",
+           "port": int(entry["port"]),
+           "gpus": entry.get("gpus") or ""}
+    for k in ("ctx", "kv", "parallel", "spec", "tools", "vision"):
+        if eff.get(k) is not None:
+            out[k] = eff[k]
+    if usage.get("n_ctx"):
+        # The live figure: a reload can have changed it since launch.
+        out["live_ctx"] = usage["n_ctx"]
+    if eff.get("pinned"):
+        out["pinned"] = eff["pinned"]
+    return out
+
+
+def _bench_reload_drift(name: str, entry: dict) -> list[tuple[str, str, str]]:
+    """For a server whose model is not loaded, what the reload the benchmark
+    is about to trigger will restore differently from its launch -- because
+    what gets measured is the reload, not the launch. Empty when unknowable.
+    """
+    args = entry.get("launch_args")
+    if not args:
+        return []
+    try:
+        m = ml.find_model(HF_HOME, args.get("model") or name)
+        if m is None:
+            return []
+        return _reload_drift(_resolve_launch(m, _launch_namespace(args)))
+    except (SystemExit, OSError, ValueError, KeyError):
+        return []
+
+
+def _bench_live(names: list[str], args) -> None:
+    """Benchmark servers that are already running, as they are, and leave
+    them running."""
+    running = _get_running()
+    results = []
+    print(f"\n  Benchmarking {len(names)} running server(s) as they are")
+    print("  (their own settings, left running afterwards — nothing is "
+          "restarted, so\n   these numbers describe the servers, not a "
+          "preset comparison)\n")
+
+    for name in names:
+        entry = running.get(name)
+        port = int(entry["port"]) if entry else 0
+        print(f"  --- {name} :{port} " + "-" * max(4, 40 - len(name)))
+        if not entry:
+            print("    stopped before its turn; skipping.\n")
+            results.append({"model": name, "error": "no longer running"})
+            continue
+        settings = _bench_live_settings(name, entry)
+        print(f"    {settings['profile']}"
+              + (f"  ·  variant {settings['variant']}"
+                 if settings["variant"] else ""))
+        row = {"model": name, "port": port, "settings": settings}
+        try:
+            if not _probe_ready(port, timeout=2.0, log_path=entry.get("log", "")):
+                raise RuntimeError("not ready yet (still loading)")
+            api_key = _resolve_api_key(args.api_key, entry.get("log", ""))
+            row.update(_bench_measure(entry, name, api_key, args.max_tokens,
+                                      live=True))
+            if row.get("shared_runs"):
+                print(f"    note: {row['shared_runs']} of {BENCH_RUNS} "
+                      f"run(s) shared the server")
+        except SystemExit:
+            # _die() already said why (usually the key); the rest still run.
+            row["error"] = "request refused"
+        except (urllib.error.HTTPError, urllib.error.URLError,
+                OSError, RuntimeError) as e:
+            print(f"    failed: {e}")
+            row["error"] = str(e)
+        results.append(row)
+        print()
+
+    print("  Results\n")
+    print(f"    {'model':<32} {'port':>5} {'steady':>10} {'mean':>9} "
+          f"{'TTFT':>7} {'chunks':>7} {'reload':>7}")
+    print("    " + "-" * 82)
+    for r in results:
+        label = r["model"][:32]
+        if "error" in r:
+            print(f"    {label:<32} {r.get('port', 0):>5} {'FAILED':>10}  "
+                  f"{r['error'][:30]}")
+            continue
+        steady = (f"{r['steady_tps']:>8.1f}/s" if r["steady_tps"]
+                  else f"{'n/a':>10}")
+        reload_s = (_fmt_secs(r["reload_secs"])
+                    if r.get("reload_secs") is not None else "-")
+        flag = "  shared" if r.get("shared_runs") else ""
+        print(f"    {label:<32} {r['port']:>5} {steady} "
+              f"{r['mean_tps']:>8.1f}/s {r['ttft']:>6.2f}s "
+              f"{r['chunks']:>7} {reload_s:>7}{flag}")
+    if any(r.get("shared_runs") for r in results):
+        print("\n    shared = other requests or a model load ran during at "
+              "least one run; its\n             numbers are what that left "
+              "over, not what the server does alone.")
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    tag = _safe_name(names[0]) if len(names) == 1 else "running"
+    _bench_save(f"bench-{tag}-live-{stamp}.json",
+                {"mode": "live", "results": results, "when": stamp})
+
+
+def _bench_save(filename: str, doc: dict) -> None:
+    out = os.path.join(LOG_DIR, filename)
+    try:
+        with open(out, "w") as f:
+            json.dump(doc, f, indent=2)
+        print(f"\n  Saved {out}\n")
+    except OSError as e:
+        print(f"\n  (could not save results: {e})\n")
+
+
+def cmd_benchmark(args):
+    """Measure steady-state tok/s.
+
+    Two questions, told apart by whether the model is already running. Not
+    running: sweep presets, each on a fresh load this command starts and
+    stops, so only the preset differs. Running: measure that server as it
+    is, and leave it be. No model at all measures every running server.
+    """
+    _ensure_dirs()
+    running = _get_running()
+    load_flags = [f for f, v in (("--preset", args.preset), ("--gpus", args.gpus),
+                                 ("--variant", args.variant)) if v]
+
+    if not args.model:
+        if load_flags:
+            _die(f"{'/'.join(load_flags)} only apply to a preset sweep on "
+                 f"fresh loads, which needs a model to load.")
+        if not running:
+            _die("nothing is running to benchmark. Name a model to sweep "
+                 "its presets on fresh loads.")
+        _bench_live(sorted(running, key=lambda n: int(running[n]["port"])),
+                    args)
+        return
+
+    m = _resolve_model(args.model)
+    if m.repo_id in running:
+        if load_flags:
+            _die(f"{m.repo_id} is already running on port "
+                 f"{running[m.repo_id]['port']}; {'/'.join(load_flags)} "
+                 f"only apply to a sweep, which needs loads benchmark owns.\n"
+                 f"         Drop {'/'.join(load_flags)} to benchmark it as it "
+                 f"is running, or stop it first to sweep.")
+        _bench_live([m.repo_id], args)
+        return
+    _bench_sweep(m, args, running)
+
+
+def _bench_sweep(m: ml.ModelInfo, args, running: dict) -> None:
+    """Load each (model, preset), measure steady-state tok/s, then stop it."""
     have = up.load_presets(STUDIO_DB)
     # No --preset means "compare every preset", which is the question the
-    # benchmark exists to answer. Fall back to a single unpresetted run.
+    # sweep exists to answer. Fall back to a single unpresetted run.
     names = args.preset or (sorted(have) if have else [""])
     missing = [n for n in names if n and up.find_preset(have, n) is None]
     if missing:
         _die(f"unknown preset(s): {', '.join(missing)}. "
              f"Have: {', '.join(sorted(have)) or 'none'}")
 
-    if m.repo_id in _get_running():
-        _die(f"{m.repo_id} is already running. Stop it first — benchmark "
-             f"needs to own the load so the numbers mean something.")
-
     results = []
     print(f"\n  Benchmarking {m.repo_id}: {len(names)} preset(s)")
     print(f"  (preset load config only — no per-model override, no sampling "
-          f"pins, so nothing but the preset differs between runs)\n")
+          f"pins, so nothing but the preset differs between runs)")
+    if running:
+        # They stay up, and they are the one thing held constant that this
+        # command did not choose: on a shared GPU their traffic is in the runs.
+        print("  Also running, left alone: "
+              + ", ".join(f"{n} :{e['port']} gpus {e.get('gpus') or '-'}"
+                          for n, e in sorted(running.items(),
+                                             key=lambda kv: int(kv[1]["port"]))))
+        print("  Numbers share the host with them; traffic on a shared GPU "
+              "shows up in the runs.")
+    print()
 
     for pname in names:
         label = pname or "(no preset)"
@@ -2635,48 +3106,23 @@ def cmd_benchmark(args):
         if not entry:
             results.append({"preset": label, "error": "vanished after start"})
             continue
-        port = int(entry["port"])
 
+        row = {"preset": label, "load_secs": round(load_secs, 1)}
         try:
-            model_id = _served_model_id(port, api_key)
-            for _ in range(BENCH_WARMUP):
-                _stream_completion(port, model_id, api_key, BENCH_PROMPT,
-                                   64, BENCH_FREEZE_TIMEOUT)
-
-            runs = []
-            for i in range(BENCH_RUNS):
-                # Distinct prompts so prefix caching cannot collapse the runs.
-                prompt = f"{BENCH_PROMPT} (variation {i + 1})"
-                res = _stream_completion(port, model_id, api_key, prompt,
-                                         args.max_tokens, BENCH_FREEZE_TIMEOUT)
-                runs.append(res)
-                s = _steady_tps(res["token_times"], BENCH_WINDOW)
-                print(f"    run {i + 1}: {len(res['token_times'])} chunks  "
-                      + (f"steady {s:.1f} tok/s" if s else "steady n/a (too short)"))
-
-            peak = [g["ours_mb"] for g in _gpu_usage_split()]
-            steady = max(_steady_tps(r["token_times"], BENCH_WINDOW) for r in runs)
-            mean_tps = sum(len(r["token_times"]) for r in runs) / max(
-                1e-9, sum(r["total"] for r in runs))
-            results.append({
-                "preset": label,
-                "steady_tps": round(steady, 2),
-                "mean_tps": round(mean_tps, 2),
-                "ttft": round(sum(r["ttft"] for r in runs) / len(runs), 3),
-                # Streamed content pieces, not tokenizer tokens: the SSE
-                # deltas are what we can actually time.
-                "chunks": sum(len(r["token_times"]) for r in runs),
-                "stalls": sum(r["stalls"] for r in runs),
-                "load_secs": round(load_secs, 1),
-                "peak_vram_mb": peak,
-            })
+            # This run's own key: the server just printed a fresh one.
+            api_key = _resolve_api_key(args.api_key, entry.get("log", ""))
+            row.update(_bench_measure(entry, m.repo_id, api_key,
+                                      args.max_tokens))
+        except SystemExit:
+            row["error"] = "request refused"
         except (urllib.error.HTTPError, urllib.error.URLError,
                 OSError, RuntimeError) as e:
             print(f"    failed: {e}")
-            results.append({"preset": label, "error": str(e)})
+            row["error"] = str(e)
         finally:
             cmd_stop(argparse.Namespace(model=m.repo_id))
             time.sleep(2)
+        results.append(row)
 
     # -- report ---------------------------------------------------------------
     print(f"\n  Results for {m.repo_id}\n")
@@ -2691,17 +3137,16 @@ def cmd_benchmark(args):
                   else f"{'n/a':>10}")
         print(f"    {r['preset']:<20} {steady} "
               f"{r['mean_tps']:>8.1f}/s {r['ttft']:>6.2f}s "
-              f"{r['chunks']:>7} {r['load_secs']:>6.0f}s")
+              f"{r['chunks']:>7} {r['load_secs']:>6.0f}s"
+              + ("  shared" if r.get("shared_runs") else ""))
+    if any(r.get("shared_runs") for r in results):
+        print("\n    shared = other requests or a model load ran during at "
+              "least one run.")
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    out = os.path.join(LOG_DIR, f"bench-{_safe_name(m.repo_id)}-{stamp}.json")
-    try:
-        with open(out, "w") as f:
-            json.dump({"model": m.repo_id, "results": results,
-                       "when": stamp}, f, indent=2)
-        print(f"\n  Saved {out}\n")
-    except OSError as e:
-        print(f"\n  (could not save results: {e})\n")
+    _bench_save(f"bench-{_safe_name(m.repo_id)}-{stamp}.json",
+                {"model": m.repo_id, "mode": "sweep", "results": results,
+                 "when": stamp})
 
 
 # -- presets -----------------------------------------------------------------
@@ -3217,26 +3662,34 @@ def _tui_act_settings(stdscr):
 # llama-server's own port, per managed pid. It is chosen at random on every
 # load (and again after every idle-reload), so it is discovered rather than
 # recorded, and cached only briefly.
-_LLAMA_PORT_CACHE: dict[int, tuple[float, int]] = {}
+_LLAMA_PORT_CACHE: dict[int, tuple[float, int, int]] = {}
 _SLOT_CACHE: dict[int, tuple[float, tuple[int, int] | None]] = {}
 _LLAMA_PORT_TTL = 30.0
 _SLOT_TTL = 3.0
 
 
-def _llama_server_port(pid: int) -> int:
-    """The port llama-server is listening on beneath a managed server, or 0.
+def _llama_server_proc(pid: int, fresh: bool = False) -> tuple[int, int]:
+    """(pid, port) of the llama-server beneath a managed server, or (0, 0).
 
     `unsloth studio run` spawns llama-server as a direct child, so the tracked
     pid is its parent -- which is what makes this findable without Unsloth
-    telling us. Returns 0 while the model is idle-unloaded: there is no
+    telling us. Returns zeros while the model is idle-unloaded: there is no
     llama-server then, which is not an error.
+
+    The child's own pid is worth carrying out with the port: it is the only
+    thing that distinguishes one llama-server from the one that replaced it
+    after an idle reload, and the token counters mean different things across
+    that line.
+
+    `fresh` skips the cache read, for a caller that must not act on a
+    30-second-old answer (a load in progress lasts less than that).
     """
     now = time.monotonic()
     hit = _LLAMA_PORT_CACHE.get(pid)
-    if hit and now - hit[0] < _LLAMA_PORT_TTL:
-        return hit[1]
+    if hit and not fresh and now - hit[0] < _LLAMA_PORT_TTL:
+        return hit[1], hit[2]
 
-    port = 0
+    child = port = 0
     try:
         for entry in os.listdir("/proc"):
             if not entry.isdigit():
@@ -3261,11 +3714,17 @@ def _llama_server_port(pid: int) -> int:
                     port = int(argv[i + 1] or 0)
                     break
             if port:
+                child = int(entry)
                 break
     except OSError:
-        port = 0
-    _LLAMA_PORT_CACHE[pid] = (now, port)
-    return port
+        child = port = 0
+    _LLAMA_PORT_CACHE[pid] = (now, child, port)
+    return child, port
+
+
+def _llama_server_port(pid: int, fresh: bool = False) -> int:
+    """The port llama-server is listening on beneath a managed server, or 0."""
+    return _llama_server_proc(pid, fresh)[1]
 
 
 # Last computed decode rate per server, and the counter sample it came from.
@@ -3278,6 +3737,34 @@ _TPS_STATE: dict[int, dict] = {}
 TPS_MIN_TOKENS = 5
 
 
+# One /metrics response answers two questions on every poll -- the live rate
+# and the token totals -- so it is fetched once and held just long enough to
+# serve the pair.
+_METRICS_CACHE: dict[int, tuple[float, dict]] = {}
+_METRICS_TTL = 2.5
+
+
+def _read_metrics(port: int) -> dict | None:
+    """llama-server's counters as {metric: value}, or None if unreadable."""
+    now = time.monotonic()
+    hit = _METRICS_CACHE.get(port)
+    if hit and now - hit[0] < _METRICS_TTL:
+        return hit[1]
+    try:
+        with _http(f"http://127.0.0.1:{port}/metrics", timeout=0.6) as r:
+            text = r.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    vals = {}
+    for line in text.splitlines():
+        if line.startswith("llamacpp:"):
+            val = _float_or_none(line)
+            if val is not None:
+                vals[line.split(" ", 1)[0]] = val
+    _METRICS_CACHE[port] = (now, vals)
+    return vals
+
+
 def _llama_tps(pid: int, port: int) -> float:
     """Recent decode rate in tokens/s, or 0 if not yet known.
 
@@ -3287,18 +3774,12 @@ def _llama_tps(pid: int, port: int) -> float:
     tracking it live -- and the last real rate is held rather than dropping to
     zero the moment a server goes quiet.
     """
-    try:
-        with _http(f"http://127.0.0.1:{port}/metrics", timeout=0.6) as r:
-            text = r.read().decode("utf-8", "replace")
-    except (urllib.error.URLError, OSError, ValueError):
+    vals = _read_metrics(port)
+    if vals is None:
         return _TPS_STATE.get(pid, {}).get("rate", 0.0)
 
-    tok = sec = None
-    for line in text.splitlines():
-        if line.startswith("llamacpp:tokens_predicted_total "):
-            tok = _float_or_none(line)
-        elif line.startswith("llamacpp:tokens_predicted_seconds_total "):
-            sec = _float_or_none(line)
+    tok = vals.get("llamacpp:tokens_predicted_total")
+    sec = vals.get("llamacpp:tokens_predicted_seconds_total")
     prev = _TPS_STATE.get(pid)
     rate = (prev or {}).get("rate", 0.0)
     if tok is not None and sec is not None:
@@ -3322,6 +3803,42 @@ def _llama_tps(pid: int, port: int) -> float:
     return rate
 
 
+# Per server: when /slots was last read, and each generating slot's n_decoded.
+_DECODE_STATE: dict[int, tuple[float, dict[int, int]]] = {}
+
+
+def _live_decode_tps(pid: int, slots: list) -> float | None:
+    """Per-stream decode rate from /slots progress, or None when not decoding.
+
+    The /metrics counters only move when a request finishes, so during one long
+    stream they hold the previous request's rate indefinitely. A generating
+    slot's `n_decoded` climbs token by token, so its growth between two reads is
+    the live rate. Averaged over the slots that advanced, which keeps it the same
+    per-stream figure the counters give once the server goes quiet.
+    """
+    now = time.monotonic()
+    decoded = {}
+    for s in slots:
+        if not s.get("is_processing"):
+            continue
+        nt = s.get("next_token")
+        nt = nt[0] if isinstance(nt, list) and nt else nt
+        if isinstance(nt, dict) and isinstance(nt.get("n_decoded"), int):
+            decoded[s.get("id", len(decoded))] = nt["n_decoded"]
+    prev = _DECODE_STATE.get(pid)
+    _DECODE_STATE[pid] = (now, decoded)
+    if not prev or not decoded:
+        return None
+    elapsed = now - prev[0]
+    # A slot that went backwards has started a new request since the last read;
+    # one still at zero is evaluating its prompt, not decoding.
+    grew = [n - prev[1][sid] for sid, n in decoded.items()
+            if sid in prev[1] and n > prev[1][sid]]
+    if elapsed <= 0 or not grew:
+        return None
+    return sum(grew) / len(grew) / elapsed
+
+
 def _float_or_none(line: str) -> float | None:
     try:
         return float(line.split()[1])
@@ -3342,10 +3859,10 @@ def _slot_usage(entry: dict) -> dict | None:
     auto-switch, any /api/inference/load), after which what we launched with is
     no longer what is running.
 
-    Throughput comes from /metrics on the same trip. llama.cpp updates those
-    counters when a request COMPLETES, not while it streams, so the figure is
-    the decode rate of the last finished request rather than a live one -- and
-    it is 0 until a server has answered something.
+    Throughput is live while a slot is generating: each slot's n_decoded on
+    this same response, compared with the previous read. Otherwise it comes from
+    /metrics, whose counters only update when a request COMPLETES -- the rate of
+    the last finished request, held, and 0 until a server has answered anything.
     """
     pid = int(entry.get("pid") or 0)
     if not pid:
@@ -3382,13 +3899,255 @@ def _slot_usage(entry: dict) -> dict | None:
                     "tps": 0.0,
                     "loaded": True,
                 }
-                usage["tps"] = _llama_tps(pid, port)
+                # Always read the counters, so the held rate stays current for
+                # when the server goes quiet; show live progress while it isn't.
+                held = _llama_tps(pid, port)
+                live = _live_decode_tps(pid, slots)
+                usage["tps"] = held if live is None else live
         except (urllib.error.URLError, OSError, ValueError):
             # A stale cached port survives an idle-reload; drop it so the next
             # call rediscovers rather than retrying a dead one for 30s.
             _LLAMA_PORT_CACHE.pop(pid, None)
     _SLOT_CACHE[pid] = (now, usage)
     return usage
+
+
+# =============================================================================
+# TOKEN ACCOUNTING
+# =============================================================================
+
+# llama-server counts the tokens it processes, but only for as long as it
+# lives: an idle unload throws the process away and the reload starts again at
+# zero, so on this box a server's own counters rarely cover more than five
+# minutes of quiet. This manager is not running most of the time either. A
+# total worth reading therefore lives here, banked from the difference each
+# poll sees, and neither restart loses what was already counted.
+#
+# Written by every poll that sees traffic, so it is kept out of state.json:
+# that file is the running-server contract, and a counter file that goes
+# missing or stale must never be able to cost a server its record.
+TOKENS_FILE = os.path.join(STATE_DIR, "tokens.json")
+
+# in/out are all-time, run_* cover the current server only, raw_* are the last
+# counters read and the llama-server they were read from.
+_TOKENS_BLANK = {"in": 0, "out": 0, "run_in": 0, "run_out": 0, "run_pid": 0,
+                 "raw_in": 0, "raw_out": 0, "raw_pid": 0}
+
+
+def _load_tokens() -> dict:
+    try:
+        with open(TOKENS_FILE) as f:
+            doc = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"models": {}}
+    if not isinstance(doc.get("models"), dict):
+        doc["models"] = {}
+    return doc
+
+
+def _save_tokens(doc: dict) -> None:
+    _ensure_dirs()
+    tmp = TOKENS_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(doc, f, indent=2)
+        os.replace(tmp, TOKENS_FILE)
+    except OSError:
+        pass          # a figure to report, never a reason to fail a command
+
+
+def _tokens_sample(name: str, entry: dict, sample: bool = True) -> dict:
+    """Bank what this server has processed since the last look, and report it.
+
+    Returns the model's record: `run_in`/`run_out` for the server running now,
+    `in`/`out` for everything this box has ever processed under that name.
+
+    Process identity decides what counts as new. The same llama-server means
+    the difference since the last read; a different one -- or none on record --
+    means the whole counter, because that process began at zero. Without the
+    pid an idle reload would either double-count the new server's tokens or
+    silently drop them.
+
+    `sample` False reports what is already banked without probing, for a caller
+    that only wants to print history.
+    """
+    doc = _load_tokens()
+    rec = dict(_TOKENS_BLANK)
+    rec.update(doc["models"].get(name, {}))
+    dirty = False
+
+    pid = int(entry.get("pid") or 0)
+    # A new server under the same name starts the run figures over. The
+    # all-time ones carry on, which is the whole point of keeping both.
+    if pid and rec["run_pid"] != pid:
+        rec.update(run_in=0, run_out=0, run_pid=pid)
+        dirty = True
+
+    child, port = _llama_server_proc(pid) if (sample and pid) else (0, 0)
+    # That lookup is cached for 30s, and a dead child means an idle reload has
+    # happened since: reading the new llama-server's counters under the old
+    # one's pid would look like the same process going backwards, and would
+    # bank its tokens twice once the cache caught up.
+    if child and not _pid_alive(child):
+        child, port = _llama_server_proc(pid, fresh=True)
+    vals = _read_metrics(port) if port else None
+    if vals is not None:
+        cur_in = int(vals.get("llamacpp:prompt_tokens_total") or 0)
+        cur_out = int(vals.get("llamacpp:tokens_predicted_total") or 0)
+        same = bool(child) and child == rec["raw_pid"]
+        d_in = cur_in - rec["raw_in"] if same else cur_in
+        d_out = cur_out - rec["raw_out"] if same else cur_out
+        # A counter going backwards under an unchanged pid is not something
+        # llama.cpp does; treat it as a reset rather than as debt.
+        d_in, d_out = max(0, d_in), max(0, d_out)
+        if d_in or d_out or not same:
+            rec["in"] += d_in
+            rec["out"] += d_out
+            rec["run_in"] += d_in
+            rec["run_out"] += d_out
+            rec.update(raw_in=cur_in, raw_out=cur_out, raw_pid=child)
+            dirty = True
+
+    if dirty:
+        doc["models"][name] = rec
+        _save_tokens(doc)
+    return rec
+
+
+def _tokens_totals(doc: dict | None = None) -> tuple[int, int]:
+    """Every model's all-time figures added up, models long since stopped too.
+
+    The headline is what the box has served, not what happens to be loaded, so
+    stopping a server must never make the number fall.
+    """
+    doc = _load_tokens() if doc is None else doc
+    return (sum(int(r.get("in") or 0) for r in doc["models"].values()),
+            sum(int(r.get("out") or 0) for r in doc["models"].values()))
+
+
+def _fmt_tokens(n: int) -> str:
+    """A token count at a glance: 812, 9.9K, 820K, 18.9M."""
+    n = int(n or 0)
+    if n < 1000:
+        return str(n)
+    for unit, scale in (("K", 1e3), ("M", 1e6), ("B", 1e9)):
+        v = n / scale
+        if v < 1000 or unit == "B":
+            if v >= 100:
+                return f"{v:.0f}{unit}"
+            return f"{v:.1f}".rstrip("0").rstrip(".") + unit
+    return str(n)
+
+
+def _fmt_token_pair(tin: int, tout: int) -> str:
+    """Input then output, arrows rather than words: the pair has to be narrow
+    enough to sit on a server's line next to everything else."""
+    return f"↑{_fmt_tokens(tin)} ↓{_fmt_tokens(tout)}"
+
+
+# Per log file: how far it has been read, and what the lines so far added up to.
+_LOAD_SCAN: dict[str, dict] = {}
+
+_LOG_TS_RE = re.compile(r'"timestamp": "([^"]+)"')
+
+
+def _log_ts(line: str) -> float | None:
+    m = _LOG_TS_RE.search(line)
+    if not m:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(m.group(1)).timestamp()
+    except ValueError:
+        return None
+
+
+def _load_timing(entry: dict) -> dict | None:
+    """How long the model's most recent load took, read from the server log.
+
+    {"secs": float | None, "after_idle": bool, "loading_since": float | None}
+    or None when the log has no load in it yet.
+
+    A load is timed from Studio's "Starting llama-server" to its "Loaded GGUF
+    model via llama-server" -- the weights going onto the GPU, which is what a
+    request arriving at an idle-unloaded server waits for. Neither Unsloth nor
+    llama-server reports this anywhere else. The first "Starting" since the
+    last completed load is the one kept, so a load that needed a retry is
+    charged its full cost rather than only the attempt that worked.
+
+    The log is read incrementally, from where the previous call stopped,
+    because the redraw asks every few seconds and a busy server's log grows by
+    megabytes of request lines. It is rotated per launch, so a file that got
+    smaller or changed inode starts the scan over.
+    """
+    path = entry.get("log") or ""
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    scan = _LOAD_SCAN.get(path)
+    if scan is None or scan["ino"] != st.st_ino or st.st_size < scan["offset"]:
+        scan = {"ino": st.st_ino, "offset": 0, "pending": None,
+                "pending_idle": False, "idle": False, "secs": None,
+                "after_idle": False}
+        _LOAD_SCAN[path] = scan
+
+    if st.st_size > scan["offset"]:
+        try:
+            with open(path, "rb") as f:
+                f.seek(scan["offset"])
+                chunk = f.read()
+        except OSError:
+            return None
+        # Only whole lines: a line still being written is read next time.
+        end = chunk.rfind(b"\n") + 1
+        scan["offset"] += end
+        for raw in chunk[:end].splitlines():
+            if b"GGUF" not in raw and b"llama-server" not in raw:
+                continue
+            line = raw.decode("utf-8", "replace")
+            if '"event": "Starting llama-server' in line:
+                if scan["pending"] is None:
+                    scan["pending"] = _log_ts(line)
+                    scan["pending_idle"] = scan["idle"]
+            elif '"event": "Loaded GGUF model via llama-server' in line:
+                done = _log_ts(line)
+                if scan["pending"] is not None and done is not None:
+                    scan["secs"] = max(0.0, done - scan["pending"])
+                    scan["after_idle"] = scan["pending_idle"]
+                scan["pending"] = None
+                scan["idle"] = False
+            elif '"event": "Unloaded GGUF model' in line:
+                # Whatever was loading did not finish as a load.
+                scan["pending"] = None
+            elif '"event": "Idle auto-unload: freed' in line:
+                scan["idle"] = True
+
+    loading_since = None
+    if scan["pending"] is not None:
+        # A load that died logs nothing that says so, so "still loading" is
+        # only claimed while a llama-server actually exists to be loading.
+        pid = int(entry.get("pid") or 0)
+        if pid and _llama_server_port(pid, fresh=True):
+            loading_since = scan["pending"]
+        elif time.time() - scan["pending"] > 15:
+            # Past the gap between the log line and the process appearing:
+            # it is gone, so stop rescanning /proc for it on every redraw.
+            scan["pending"] = None
+    if scan["secs"] is None and loading_since is None:
+        return None
+    return {"secs": scan["secs"], "after_idle": scan["after_idle"],
+            "loading_since": loading_since}
+
+
+def _fmt_secs(s: float) -> str:
+    if s < 10:
+        return f"{s:.1f}s"
+    s = round(s)
+    if s < 60:
+        return f"{s}s"
+    return f"{s // 60}m{s % 60:02d}s"
 
 
 _EFFECTIVE_CACHE: dict[tuple, dict] = {}
@@ -3672,8 +4431,39 @@ def _tui_act_test(stdscr):
 
 
 def _tui_act_benchmark(stdscr):
-    name = _tui_pick_model(stdscr, title="Benchmark which model?")
-    if not name:
+    import curses
+    running = _get_running()
+    models = ml.scan_models(HF_HOME)
+    if not models and not running:
+        tui.pause(stdscr, f"No models in {ml.hub_dir(HF_HOME)}. Enter ...")
+        return
+    # A running model is measured as it is and left running; anything else is
+    # a preset sweep on fresh loads. Mark which is which before the pick, since
+    # the two answer different questions.
+    names, items = [], []
+    if running:
+        names.append("")
+        items.append((f"  every running server, as it is  ({len(running)})",
+                      curses.color_pair(_C_GREEN) | curses.A_BOLD))
+    for m in models:
+        live = m.repo_id in running
+        names.append(m.repo_id)
+        items.append((f"{'* ' if live else '  '}{m.repo_id}   "
+                      + (f"running :{running[m.repo_id]['port']}, as it is"
+                         if live else f"{ml.human_size(m.size_bytes)}  sweep"),
+                      curses.color_pair(_C_GREEN) if live else 0))
+    header = [("* running: measured in place and left running.  "
+               "Others: presets swept on fresh loads.",
+               curses.color_pair(_C_DIM))]
+    idx = tui.select(stdscr, "Benchmark what?", items, header=header)
+    if idx < 0:
+        return
+    name = names[idx]
+    if not name or name in running:
+        key = tui.text(stdscr, "API key (blank = from the server log): ")
+        tui.run_cmd(stdscr, cmd_benchmark, argparse.Namespace(
+            model=name, preset=None, api_key=key, gpus="", variant="",
+            max_tokens=BENCH_MAX_TOKENS))
         return
     # Quant before presets, as in the start flow: it belongs to the model, and
     # every preset in the run is measured against the one quant.
@@ -3756,9 +4546,17 @@ def _tui_main(stdscr):
 
     def _build_header():
         running = _get_running()
+        # Bank every running server's counters before the totals are read, so
+        # the headline agrees with the lines under it -- and so a server this
+        # screen is too short to show is still counted.
+        tokens = {name: _tokens_sample(name, e) for name, e in running.items()}
         header = []
         ts = time.strftime("%H:%M:%S")
         every = f"{refresh_ms // 1000}s"
+
+        # All-time and host-wide, so it counts models that are not running
+        # now and does not fall when one is stopped.
+        churned = f"all-time {_fmt_token_pair(*_tokens_totals())}"
 
         if running:
             n_ready = sum(1 for e in running.values()
@@ -3766,6 +4564,7 @@ def _tui_main(stdscr):
                                           log_path=e.get("log", "")))
             header.append((
                 f"Running: {len(running)} model(s), {n_ready} ready"
+                f"   {churned}"
                 f"     ⏱ {ts} · refresh {every}",
                 curses.A_BOLD | curses.color_pair(_C_GREEN)))
             # Two lines per model reads far better, but the menu below must
@@ -3834,6 +4633,28 @@ def _tui_main(stdscr):
                         (f"{rate:.0f} tok/s" if rate else "").ljust(10),
                         curses.color_pair(_C_GREEN) if busy and rate
                         else curses.color_pair(_C_DIM)))
+                # This server's own work, so it covers the current run only --
+                # the all-time figure is on the summary line above, and a
+                # per-model line that mixed the two would read as one number.
+                tk = tokens[name]
+                pair = _fmt_token_pair(tk["run_in"], tk["run_out"])
+                # Never sliced mid-number: a screen with no room for the whole
+                # pair shows none of it, and on a one-line layout it also has
+                # to leave the settings something to be truncated into. The
+                # all-time figure in the header survives either way.
+                used = sum(len(t) for t, _ in line)
+                if len(pair) <= cols - used - (4 if two_line else 24):
+                    line.append((pair.ljust(16), curses.color_pair(_C_DIM)))
+                # What the last load cost -- and so what the next request to
+                # an idle-unloaded server will wait -- or a reload under way.
+                lt = _load_timing(entry)
+                if lt and lt["loading_since"] is not None:
+                    since = max(0.0, time.time() - lt["loading_since"])
+                    line.append((f"loading {_fmt_secs(since)} ".ljust(13),
+                                 curses.color_pair(_C_CYAN) | curses.A_BOLD))
+                elif lt and lt["secs"] is not None:
+                    line.append((f"load {_fmt_secs(lt['secs'])} ".ljust(13),
+                                 curses.color_pair(_C_DIM)))
                 if two_line:
                     header.append(line)
                     header.append([("      ", 0)]
@@ -3849,13 +4670,15 @@ def _tui_main(stdscr):
                                curses.color_pair(_C_DIM)))
         else:
             header.append((
-                f"Running: none     ⏱ {ts} · refresh {every}",
+                f"Running: none   {churned}"
+                f"     ⏱ {ts} · refresh {every}",
                 curses.A_DIM))
 
         header.append(("", 0))
         gsplit = _gpu_usage_split()
         if gsplit:
-            header.append(("GPU memory (live, actual):", curses.A_BOLD))
+            header.append(("GPUs (live, actual): memory · compute · "
+                           "temperature · power", curses.A_BOLD))
             for g in gsplit:
                 header.append(_gpu_bar_line(g))
             header.append([
@@ -3868,7 +4691,7 @@ def _tui_main(stdscr):
                 (" free", curses.color_pair(_C_DIM)),
             ])
         else:
-            header.append(("GPU memory: nvidia-smi unavailable", curses.A_DIM))
+            header.append(("GPUs: nvidia-smi unavailable", curses.A_DIM))
 
         tot, avail = _read_mem_gb()
         if tot:
@@ -4091,13 +4914,19 @@ Override with --api-key or UNSLOTH_MGR_API_KEY.
     sp.set_defaults(func=cmd_test)
 
     sp = sub.add_parser("benchmark",
-                        help="measure steady-state tok/s per preset")
-    sp.add_argument("model")
+                        help="measure steady-state tok/s: per preset, or of "
+                             "the running servers")
+    sp.add_argument("model", nargs="?", default="",
+                    help="running: measure it as it is. Not running: sweep "
+                         "presets on fresh loads. Omitted: every running "
+                         "server")
     sp.add_argument("--preset", action="append",
-                    help="repeatable; default is every preset in studio.db")
-    sp.add_argument("--gpus", default="", help="CUDA devices for every run")
+                    help="sweep only; repeatable; default is every preset in "
+                         "studio.db")
+    sp.add_argument("--gpus", default="",
+                    help="sweep only: CUDA devices for every run")
     sp.add_argument("--variant", default="",
-                    help="GGUF quant (default: best that fits)")
+                    help="sweep only: GGUF quant (default: best that fits)")
     sp.add_argument("--api-key", default="",
                     help="bearer token (default: from the server log)")
     sp.add_argument("--max-tokens", type=int, default=BENCH_MAX_TOKENS,

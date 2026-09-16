@@ -42,6 +42,7 @@ CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
 - [Idle auto-unload, and what a reload restores](#idle-auto-unload-and-what-a-reload-restores)
 - [Keeping a server warm](#keeping-a-server-warm)
 - [Reading settings back after a load](#reading-settings-back-after-a-load)
+- [Tokens churned](#tokens-churned)
 - [Instance groups](#instance-groups)
 - [Ports and instance limit](#ports-and-instance-limit)
 - [API keys](#api-keys)
@@ -99,22 +100,42 @@ own default is dim; anything this manager changed is bright, so the line
 answers "what am I not running stock?" at a glance:
 
 ```
-  ● Qwen3.6-35B-A3B-MTP-GGUF UD-Q4_K_XL :10001 rdy g0   0/2sl
+Running: 2 model(s), 2 ready   all-time ↑18.9M ↓4.1M     ⏱ 21:40:03 · refresh 5s
+  ● Qwen3.6-35B-A3B-MTP-GGUF UD-Q4_K_XL :10001 rdy g0   0/2sl            ↑820K ↓191K    load 9.3s
       256k  kv q4_0  mtp  tools ON  no-vis  | T1.0 P0.95 K20 M0.0 pres0.0 rep1.0
-  ● Qwen3.8-27B-GGUF         UD-Q4_K_XL :10002 rdy g1   0/3sl  16 tok/s
+  ● Qwen3.8-27B-GGUF         UD-Q4_K_XL :10002 rdy g1   1/3sl  16 tok/s  ↑614K ↓121K    load 13s
       256k  kv q4_0  mtp  tools off  no-vis  warm | T1.0 P0.95 K20 M0.0 pres0.0 rep1.0
 ```
 
-The first line is what a server *is* — identity, placement, and the two facts
-that change second to second. `1/3sl` is **sessions: one of three decode slots
-busy right now**, and `8 tok/s` its recent decode rate. Everything on the
-second line is configuration, which does not move. `status` spells both out
-(`sessions 1/3  8.0 tok/s`), as does the `settings` readout.
+The first line is what a server *is* — identity, placement, and the facts that
+change as it runs. `1/3sl` is **sessions: one of three decode slots busy right
+now**, `8 tok/s` its recent decode rate, `↑614K ↓121K` the input and output
+tokens it has processed since it started, and `load 9.3s` how long its most
+recent model load took. Everything on the second line is configuration, which
+does not move. `status` spells them out (`sessions 1/3  8.0 tok/s  last load
+9.3s (idle reload)`), and the `settings` readout carries sessions and rate.
+
+The figure in the header is the other half of that pair: every model's tokens,
+all-time, for the box rather than for one server — see
+[Tokens churned](#tokens-churned).
+
+The load time is what an idle unload costs: once Studio has freed the weights,
+the next request waits that long before its first token, so the figure stays on
+the line — dim — while the server sits unloaded. It is timed from Studio's
+`Starting llama-server` log line to its `Loaded GGUF model via llama-server`,
+which nothing else reports; the first attempt is the one kept, so a load that
+needed a retry is charged its full cost. While a reload is under way the column
+reads `loading 4s` in bright cyan instead — claimed only while a `llama-server`
+process actually exists beneath the server, because a load that dies logs
+nothing that says so. The log is read incrementally from where the last redraw
+stopped, so a busy server's megabytes of request lines are never re-read.
 
 Nothing above `llama-server` reports either: Unsloth's status carries the slot
 *count* but never the occupancy, and no throughput at all. So the manager finds
 `llama-server` — it is a direct child of the pid already tracked — and reads
-its `/slots` and `/metrics`. Both probes share one 3-second cache and a 0.6s
+its `/slots` and `/metrics`. Each is fetched at most once per redraw — a
+3-second cache on `/slots`, 2.5 on `/metrics`, whose one response serves both
+the rate and the [token totals](#tokens-churned) — and both carry a 0.6s
 timeout, so the 5-second redraw never waits on them.
 
 An idle-unloaded model still shows `0/2sl`, because with nothing loaded "no
@@ -127,10 +148,14 @@ the unload is history, not status.
 
 Throughput is Δtokens ÷ Δgeneration-seconds between probes, from llama.cpp's
 own cumulative counters — the rate it actually decoded at, not an average
-diluted by idle time. Two details matter. llama.cpp updates those counters when
-a request *completes*, so the number lags a long stream rather than tracking it
-live, and the last real rate is held rather than dropping to zero the moment a
-server goes quiet. And a window must carry at least 5 tokens to count, because
+diluted by idle time. Two details matter. llama.cpp updates those counters only
+when a request *completes*, so during one long stream they would hold the
+previous request's rate for as long as it runs. While a slot is generating the
+figure therefore comes from `/slots` instead: each busy slot's `n_decoded`
+climbs token by token, and its growth between two redraws is the live rate,
+averaged across the slots that advanced so it stays a per-stream figure like the
+counters'. Once the server goes quiet the last completed rate is held rather
+than dropping to zero. And a window must carry at least 5 tokens to count, because
 a keep-warm ping is a one-token generation and would otherwise be what the
 figure reported. On first sight of a server the cumulative counters seed it, so
 a freshly opened screen shows a real number instead of a blank.
@@ -211,7 +236,7 @@ python unsloth_manager.py start <model> [--port N] [--gpus 0,1] [--dry-run]
 python unsloth_manager.py status                          # running servers, ports, GPU usage
 python unsloth_manager.py logs <model> [-n N] [-f]        # tail a server log
 python unsloth_manager.py test <model> --api-key KEY      # one streaming prompt + tok/s
-python unsloth_manager.py benchmark <model> [--preset NAME ...] --api-key KEY
+python unsloth_manager.py benchmark [<model>] [--preset NAME ...]  # running: as-is; else a preset sweep
 python unsloth_manager.py restart <model>                 # keeps port, GPUs and profile choices
 python unsloth_manager.py stop <model>
 python unsloth_manager.py stop-all
@@ -243,15 +268,15 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | `start <model>` | Start a server. The bulk of the options; see below. |
 | `stop <model>` / `stop-all` | SIGTERM, escalating to a process-group SIGKILL after `STOP_TIMEOUT`. |
 | `restart <model>` | Stop then start, keeping port, GPUs, quant and profile choices. |
-| `status` | Running servers, their settings, ports, uptime and GPU usage. |
-| `list [--variants]` | Cached models; `--variants` adds each GGUF quant, its size and VRAM fit. |
+| `status` | Running servers, their settings, ports, uptime, token totals and GPU usage. |
+| `list [--variants]` | Cached models and their all-time token totals; `--variants` adds each GGUF quant, its size and VRAM fit. |
 | `settings <model>` | All four settings sources side by side, plus live state if it is running. |
 | `presets` | Studio presets from `studio.db`, read-only. |
 | `groups [list\|save\|restore\|show\|clear] [slot]` | Instance groups — see [Instance groups](#instance-groups). |
 | `keepalive <model>` | Ping a server so Studio never idle-unloads it — see [Keeping a server warm](#keeping-a-server-warm). |
 | `logs <model> [-n N] [-f]` | Tail a server log. |
 | `test <model>` | One streaming prompt, with TTFT and tok/s. |
-| `benchmark <model>` | Steady-state tok/s per preset — see [Benchmark](#benchmark). |
+| `benchmark [<model>]` | Steady-state tok/s: a running server as it is, every running server, or a preset sweep on fresh loads — see [Benchmark](#benchmark). |
 | `doctor` | Check the host can serve before anything is launched. |
 
 ### `start` options
@@ -312,9 +337,9 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | `logs -f` / `--follow` | Follow the log as it grows. |
 | `test --prompt "..."` | Prompt to send (default: a short built-in one). |
 | `test --max-tokens N` | Generation cap (default 256). |
-| `benchmark --preset NAME` | Repeatable; default is every preset in `studio.db`. |
+| `benchmark --preset NAME` | Sweep only. Repeatable; default is every preset in `studio.db`. |
 | `benchmark --max-tokens N` | Generation cap per measured run (default 400). |
-| `benchmark --gpus` / `--variant` | Placement and quant, held constant across runs. |
+| `benchmark --gpus` / `--variant` | Sweep only: placement and quant, held constant across runs. |
 | `settings --variant Q` | Which quant's profile to look up (default: best that fits). |
 | `groups --name "..."` | Label for a saved group. |
 | `groups --wait N` | Seconds to wait per model on restore (`0` = don't wait). |
@@ -335,11 +360,25 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | **Status** | Full `status` output. |
 | **List Models** | Cached models and quants. |
 | **Test Model** | One streaming prompt against a running server. |
-| **Benchmark** | Measure steady-state tok/s across presets. |
+| **Benchmark** | Every running server as it is, one running server (`*`), or a preset sweep for a model that is not running. |
 | **API Tester** | Hands off to `api_tester.sh`. |
 | **View Logs** | Tail a server log. |
 | **Studio Presets** | What the Studio UI has saved. |
 | **Environment Check** | `doctor`. |
+
+Above the menu, each GPU gets one live line, refreshed with the rest of the
+header and laid out like btop's GPU box:
+
+```
+GPU1 [████████████████░░░░] 26/32G   use ■■■■■■■■ 98%  82°C   pwr ■■■■···· 147/300W  Tesla V100-SXM2-32GB
+```
+
+Memory is split into this manager's servers (green) and everything else
+(yellow). `use` is compute utilisation and `pwr` is draw against the card's
+power limit; both meters shade green → yellow → red cell by cell, and the
+temperature turns yellow at 70°C and red at 85°C. A sensor the card does not
+report shows `-`. `status` prints the same figures, and all of them come from
+the single `nvidia-smi` query the memory bars already made.
 
 Every screen takes Up/Down/Home/End, Enter to choose, and Esc or `q` to back
 out — cancelling any step of a flow abandons the whole action rather than
@@ -625,6 +664,66 @@ keys — it reads back the one `unsloth studio run` minted and printed into the
 log it was already capturing. Pass `--api-key` to use a different one. If no
 key can be found, the readout is skipped and says so; the load is unaffected.
 
+## Tokens churned
+
+The home screen carries two token figures, and they are deliberately different
+things. Each server's line shows what **that server** has processed since it
+started; the summary line at the top shows what **this box** has processed
+all-time — every model, models that are not running now included, so stopping a
+server never makes the number fall.
+
+```
+Running: 2 model(s), 2 ready   all-time ↑18.9M ↓4.1M     ⏱ 21:40:03 · refresh 5s
+  ● Qwen3.8-27B-GGUF  UD-Q4_K_XL :10002 rdy g1  1/3sl  16 tok/s  ↑614K ↓121K
+```
+
+`status` prints both per server, in full, and adds the host line:
+
+```
+      tokens  this run ↑412,004 in ↓96,211 out   ·   all-time ↑9,204,551 in ↓2,001,884 out
+  Tokens, all-time: ↑18,912,004 in · ↓4,102,119 out across 7 model(s), 5 not running
+```
+
+`list` carries the all-time pair for any model that has ever served a request,
+running or not, and the run figures beside it for the ones that are.
+
+**Where the numbers come from.** `llama-server` counts the tokens it processes,
+and the manager reads its `/metrics` on the same poll that already fetches the
+decode rate — one request, not two. But those counters live and die with that
+process: on this box an idle unload throws it away after five minutes, and the
+reload starts again at zero. So the totals are kept here instead, in
+`STATE_DIR/tokens.json`, banked from the difference each poll sees:
+
+- The llama-server's **pid** decides what "new" means. The same process means
+  the difference since the last read; a different one — or none on record —
+  means the whole counter, because that process started at zero. Without that
+  check an idle reload would either double-count the new server or drop it.
+- Because the counters are cumulative, a gap in polling costs nothing as long
+  as the process survives it: the next look catches the whole gap up. What is
+  lost is a `llama-server` that loaded, worked and idle-unloaded *entirely*
+  between two looks — so the totals are complete for a box where the TUI is
+  left open or `status` is run now and then, and conservative otherwise.
+- `stop` takes one last reading before it signals, so an orderly stop banks
+  everything; a `kill -9` from outside costs at most the last poll.
+- The file is kept separate from `state.json` on purpose. It is written by
+  every poll that sees traffic, and a counter file that goes missing or lands
+  half-written must never be able to cost a server its record. It is written by
+  atomic replace, and a read that fails starts the counting over rather than
+  failing the command.
+
+**What the two figures actually count.** Both are `llama-server`'s own: `↓` is
+tokens predicted, `↑` is prompt tokens *evaluated*. A request whose prefix was
+already in the KV cache is not re-evaluated, so the input figure is the work
+the server did, not the size of what the client sent — it reads low against a
+provider-style bill, and it is the honest number for "what has this box
+chewed through". Both only move when a request **completes**, which is the same
+caveat the throughput figure carries: a stream in flight adds nothing until it
+ends.
+
+There is no reset command. Delete `STATE_DIR/tokens.json` — with nothing
+running, or accepting that each live server's current counters are then banked
+in full on the next poll — and counting starts over.
+
 ## Instance groups
 
 A group is a named snapshot of what is running **and every answer each launch
@@ -742,27 +841,80 @@ missing.
 ## Benchmark
 
 ```bash
+python unsloth_manager.py benchmark                         # every running server, as it is
+python unsloth_manager.py benchmark <running model>         # that server, as it is
 python unsloth_manager.py benchmark <model> --preset "Default 1" --preset "MTP+Ngram 256k"
 ```
 
-With no `--preset` it runs **every** preset in `studio.db`, which is the
-question the command exists to answer: which of your presets is actually
-fastest on this model. Each run uses `--load-profile preset --sampling none`,
-so the preset is genuinely the only thing that differs: a per-model override
-would otherwise supply the same load config to every run and flatten the
-comparison. For each one it starts the server, waits for readiness,
-runs a warm-up plus N measured generations with distinct prompts (so prefix
-caching cannot collapse the batch), then hard-stops the server. It reports:
+The command answers one of two questions, decided by whether the model is
+already running.
+
+**A running server is measured as it is, and left running.** Its settings are
+whatever it was launched with, or whatever Studio has since reloaded it with,
+and no flag of this command chose them. So the saved result carries them: the
+profile, quant, port, GPUs, context (live, as well as launched), KV type, slots,
+spec mode, tools, and sampling pins. With no model at all, every running server
+is measured in turn, in port order. `--preset`, `--gpus` and `--variant` are
+refused here, because they describe a fresh load; stop the server first to
+sweep it.
+
+A running server's model may not be loaded when its turn comes. It may have
+been idle-unloaded, or swapped out by a client that asked that server for a
+different model. The warm-up brings it back, gets the load timeout rather than
+the stall one, and its wait is reported in the `reload` column. The run says
+which case it was: swapping a model back in interrupts whoever was using the
+other one. It also names any field that the reload restores from `studio.db`
+differently from the launch, since the reload is what gets measured
+([Idle auto-unload](#idle-auto-unload-and-what-a-reload-restores)).
+
+**A model that is not running gets a preset sweep.** With no `--preset` it runs
+**every** preset in `studio.db`, which is the question the sweep exists to
+answer: which of your presets is actually fastest on this model. Each run uses
+`--load-profile preset --sampling none`, so the preset is genuinely the only
+thing that differs: a per-model override would otherwise supply the same load
+config to every run and flatten the comparison. For each one it starts the
+server, waits for readiness, measures, then hard-stops the server. Other servers
+already running are listed and left alone; they share the host, and on a shared
+GPU their traffic is in the numbers.
+
+Either way, a warm-up plus N measured generations with distinct prompts (so
+prefix caching cannot collapse the batch). It reports:
 
 - **Steady tok/s**: best sustained rate over a sliding window (default 5s), so
   one mid-stream stall does not sink the number. `n/a` when the generation was
   too small to distinguish a sustained rate from a burst.
 - **Mean tok/s**: overall including stalls, for contrast.
-- TTFT, chunk count, stall count, load time, and per-GPU VRAM attributed to the
-  server.
+- TTFT, chunk count, stall count, load (sweep) or reload (running) time, and
+  per-GPU VRAM attributed to that server's own processes, not to everything
+  the manager runs.
 
-Results print as a table and are saved as timestamped JSON in the log dir. The
-model must not already be running — benchmark needs to own the load.
+Results print as a table and are saved as timestamped JSON in the log dir
+(`bench-<model>-<stamp>.json` for a sweep, `bench-<model|running>-live-<stamp>.json`
+for running servers).
+
+**Runs that shared the server are flagged `shared`, never silently averaged
+in.** After each measured run the benchmark reads what the server log gained
+during it. Any request other than its own, or any `Starting llama-server` (a
+model load), marks the run. A keep-warm ping counts too. The log is the only view
+that sees all of it. `llama-server`'s `/slots` shows requests decoding at that
+instant, but not one queued behind Unsloth's tool layer, nor one waiting on a
+model switch. A client that asks the same server for another model makes Studio
+unload yours, load theirs, and load yours back. That cost a measured run over a
+minute of TTFT while `/slots` reported the server idle.
+
+Benchmark requests name the server's own model, matched by repo id on
+`/v1/models`, and never simply the first entry there. Studio lists every model
+it could serve on that endpoint, and asking for any of them swaps it in. On an
+idle-unloaded server the first entry can be some other cached model, and
+requesting it loads that model onto the server. `test` and the keep-warm pinger
+look the id up the same way.
+
+They also send `enable_tools: false`, as `test` does. With Unsloth's
+server-side tools on, a model asked for a long technical answer stops to run web
+searches partway through. That puts network round-trips into TTFT, and on a
+live server it queues other clients behind the benchmark. The numbers describe
+the model, not the tool layer. What tools on costs a server is covered in
+[Gotchas](#gotchas-worth-knowing).
 
 Two honest caveats about the numbers:
 
@@ -923,7 +1075,7 @@ the weights are not in the service account's `~/.cache/huggingface`).
 | `UNSLOTH_MGR_STUDIO_DB` | `<STUDIO_HOME>/studio.db` | Where presets and per-model overrides are read from. |
 | `UNSLOTH_MGR_STUDIO_ASSETS` | globbed under `<STUDIO_HOME>` | Unsloth's `assets/configs` (its shipped sampling tables). |
 | `UNSLOTH_MGR_HF_HOME` | `~<user>/.cache/huggingface` | Model cache; passed to the child as `HF_HOME`. |
-| `UNSLOTH_MGR_STATE_DIR` | `/root/.unsloth-pids` | State file directory. |
+| `UNSLOTH_MGR_STATE_DIR` | `/root/.unsloth-pids` | State file directory: `state.json`, `groups.json`, `tokens.json`. |
 | `UNSLOTH_MGR_LOG_DIR` | `/root/.unsloth-logs` | Per-model server logs + benchmark JSON. |
 | `UNSLOTH_MGR_BASE_PORT` | `10001` | First port in the API pool. |
 | `UNSLOTH_MGR_MAX_INSTANCES` | `8` | Pool size, and therefore the concurrent-server cap. |
