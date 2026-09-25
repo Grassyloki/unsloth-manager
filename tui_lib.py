@@ -3,7 +3,7 @@ tui_lib.py — shared curses helpers for unsloth_manager.py.
 
 Owns the colour scheme, list/checkbox selector, text input prompt, and the
 'leave curses to run a CLI command then come back' wrapper, so a fix lands
-once. Carried over unchanged from the vllm-manager sibling project.
+once. Carried over from the vllm-manager sibling project.
 
 Usage:
     import tui_lib as tui
@@ -16,7 +16,6 @@ Usage:
     tui.launch(_ui)
 """
 from __future__ import annotations
-import os
 import sys
 
 
@@ -59,7 +58,7 @@ def addstr(win, y, x, text, attr=0):
 # == Selector widget =========================================================
 
 def select(stdscr, title, items, *, header=None, multi=False,
-           refresh_cb=None, refresh_ms=5000):
+           refresh_cb=None, refresh_ms=5000, start=0):
     """
     Interactive list / checkbox selector.
 
@@ -69,6 +68,8 @@ def select(stdscr, title, items, *, header=None, multi=False,
     multi=True:  Space toggles, Enter confirms, returns list[int] or [] on cancel.
     refresh_cb:  optional callable returning (new_header, new_items) every
                  refresh_ms ms while idle. Either may be None to leave unchanged.
+    start:       index the cursor starts on, so a screen redrawn after an
+                 action can keep the user's place.
 
     Keys: Up/Down/Home/End to move, Esc or q to cancel.
     """
@@ -77,7 +78,7 @@ def select(stdscr, title, items, *, header=None, multi=False,
     if not items:
         return [] if multi else -1
 
-    sel = 0
+    sel = min(max(0, start), len(items) - 1)
     checks = [False] * len(items) if multi else None
 
     if refresh_cb is not None:

@@ -27,10 +27,17 @@ Four sources feed a launch, none of which this module writes to:
      models — never on the direct /api/inference/load that `unsloth studio
      run` performs — so a headless launch has to read them itself.
 
-Everything here is read-only. Studio owns both files.
+Everything here READS. Studio owns both files, and every read is a read-only
+SQLite connection. The one write this project makes -- an explicit "save to
+profile" from `start` -- is not done here and never touches the database
+directly: the manager sends it through Studio's own settings API, so Studio's
+validation, locking and cache invalidation all apply. What lives here is only
+the knowledge of Studio's field names that the payloads need (WRITING BACK,
+at the end).
 """
 from __future__ import annotations
 
+import copy
 import glob
 import json
 import os
@@ -466,6 +473,10 @@ class Preset:
     n_batch: int | None = None
     n_ubatch: int | None = None
     tensor_parallel: bool | None = None
+    # Only the OFF direction, as in a per-model override: the UI writes
+    # disableVision false on every preset, which means "Unsloth's default",
+    # not a request to attach the projector.
+    disable_vision: bool | None = None
     # -- params: the chat UI's sampling ------------------------------------
     sampling: dict = field(default_factory=dict)
     # Recorded for display only: no `studio run` flag carries these.
@@ -538,6 +549,7 @@ def _preset_from_json(entry: dict) -> Preset | None:
         n_ubatch=_opt_int(load, "nUbatch"),
         tensor_parallel=(None if load.get("tensorParallel") is None
                          else bool(load["tensorParallel"])),
+        disable_vision=(True if load.get("disableVision") is True else None),
         sampling=_sampling_from_params(params),
         max_tokens=_opt_int(params, "maxTokens"),
         system_prompt=str(params.get("systemPrompt") or ""),
@@ -556,6 +568,19 @@ def load_presets(studio_db: str) -> dict[str, Preset]:
             if p is not None:
                 out[p.name] = p
     return out
+
+
+def raw_preset(studio_db: str, name: str) -> dict | None:
+    """One preset exactly as Studio stored it, for a write-back to start from
+    and to compare against: the parsed Preset drops every field this manager
+    does not model, and a save must carry those through untouched."""
+    raw = _read_setting(studio_db, "chat_settings", PRESETS_KEY)
+    if not isinstance(raw, list):
+        return None
+    for entry in raw:
+        if isinstance(entry, dict) and entry.get("name") == name:
+            return entry
+    return None
 
 
 def active_preset_name(studio_db: str) -> str:
@@ -622,13 +647,7 @@ class ModelOverride:
 
 def _override_from_json(key: str, raw: dict) -> ModelOverride:
     def _int(name):
-        v = raw.get(name)
-        if v is None or isinstance(v, bool):
-            return None
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
+        return _opt_int(raw, name)
 
     kv = raw.get("kv_cache_dtype")
     kv = kv if isinstance(kv, str) and kv.lower() in VALID_KV_DTYPES else None
@@ -686,12 +705,7 @@ def _override_from_json(key: str, raw: dict) -> ModelOverride:
 # no reload can touch.
 
 IDLE_UNLOAD_KEY = "openai_api_auto_unload_idle_seconds"
-AUTO_SWITCH_KEY = "openai_api_auto_switch_model"
 MIN_IDLE_UNLOAD_SECONDS = 60
-
-
-def auto_switch_enabled(studio_db: str) -> bool:
-    return _read_setting(studio_db, "app_settings", AUTO_SWITCH_KEY) is True
 
 
 def idle_unload_seconds(studio_db: str) -> int:
@@ -748,6 +762,12 @@ def override_lookup_keys(repo_id: str, variant: str = "") -> list[str]:
     return [k for k in ordered if k]
 
 
+def raw_override(studio_db: str, key: str) -> dict:
+    """The stored row under exactly `key` ({} when absent), unparsed."""
+    row = load_overrides(studio_db).get(key) if key else None
+    return dict(row) if isinstance(row, dict) else {}
+
+
 def model_override(studio_db: str, repo_id: str,
                    variant: str = "") -> ModelOverride:
     """The per-model launch config Unsloth has stored, or an empty one.
@@ -770,3 +790,177 @@ def model_override(studio_db: str, repo_id: str,
         if len(folded) == 1:
             return _override_from_json(folded[0], table[folded[0]])
     return ModelOverride()
+
+
+# =============================================================================
+# WRITING BACK (payloads for Studio's own settings API)
+# =============================================================================
+# `start --save-profile` writes an edited launch back into the profile it came
+# from. The manager sends these through Studio's HTTP API rather than into
+# studio.db, so Studio validates, normalises, locks and invalidates its caches
+# exactly as it does for its own settings page. Only the payload shapes live
+# here, because they are Studio's field names, not process logic.
+#
+# Field names on our side are Launch's: ctx, kv_cache_dtype, spec_mode,
+# spec_draft_n_max, parallel, n_batch, n_ubatch, tensor_parallel, vision, plus
+# SAMPLING_FIELDS.
+
+# The load fields a profile can hold, in the order a readout lists them.
+PROFILE_LOAD_FIELDS = ("ctx", "kv_cache_dtype", "spec_mode", "spec_draft_n_max",
+                       "parallel", "n_batch", "n_ubatch", "tensor_parallel",
+                       "vision")
+
+# Launch field -> (override key, preset loadConfig key), for the ones that map
+# one-to-one. ctx, spec_mode, tensor_parallel and vision each need a rule.
+_PLAIN_LOAD_KEYS = {
+    "kv_cache_dtype": ("kv_cache_dtype", "kvCacheDtype"),
+    "spec_draft_n_max": ("spec_draft_n_max", "specDraftNMax"),
+    "parallel": ("n_parallel", "nParallel"),
+    "n_batch": ("n_batch", "nBatch"),
+    "n_ubatch": ("n_ubatch", "nUbatch"),
+}
+
+# Every override field a PUT REPLACES. Studio's save is not a patch: anything
+# left out of the payload is cleared -- a gpu_ids pin, a chat template, a
+# manual-offload layer count -- so the stored row is echoed back in full and
+# only the edited fields change. llama_extra_args, the server-tuning four and
+# the reasoning pair are deliberately NOT echoed: Studio carries those over by
+# itself when a payload omits them (mirrors_* left false), and echoing the
+# flags would re-validate ones since denylisted and 400 an unrelated save.
+_OVERRIDE_REPLACED = ("max_seq_length", "custom_context_length",
+                      "kv_cache_dtype", "mlx_kv_bits", "speculative_type",
+                      "spec_draft_n_max", "n_parallel", "n_batch", "n_ubatch",
+                      "chat_template_override", "gpu_memory_mode", "gpu_layers",
+                      "n_cpu_moe", "gpu_ids", "gpu_index_kind")
+
+
+def override_payload(key: str, row: dict, values: dict) -> dict:
+    """The PUT /api/settings/openai-auto-switch/overrides body that stores
+    `row` with `values` applied, under `key`.
+
+    An all-default result is a valid payload: Studio reads a row with no
+    usable fields as a removal, which is exactly what "every value back at
+    Unsloth's default" means.
+    """
+    body: dict = {"model_id": key}
+    for name in _OVERRIDE_REPLACED:
+        if row.get(name) is not None:
+            body[name] = row[name]
+    # Booleans with a False default: omitting them clears them, so they are
+    # always sent.
+    body["tensor_parallel"] = row.get("tensor_parallel") is True
+    body["disable_vision"] = row.get("disable_vision") is True
+
+    for fld, val in values.items():
+        if fld == "ctx":
+            # max_seq_length outranks custom_context_length on read, so an
+            # edit must clear it or the old number keeps winning. 0 is
+            # fit-max: no pin at all.
+            body.pop("max_seq_length", None)
+            body.pop("custom_context_length", None)
+            if val:
+                body["custom_context_length"] = int(val)
+        elif fld == "spec_mode":
+            # Absent already means auto; storing the word adds nothing.
+            body.pop("speculative_type", None)
+            if val and val != "auto":
+                body["speculative_type"] = val
+        elif fld == "tensor_parallel":
+            body["tensor_parallel"] = bool(val)
+        elif fld == "vision":
+            body["disable_vision"] = val is False
+        elif fld in _PLAIN_LOAD_KEYS:
+            name = _PLAIN_LOAD_KEYS[fld][0]
+            body.pop(name, None)
+            if val is not None:
+                body[name] = val
+    return body
+
+
+# Our sampling names -> the chat UI's camelCase, the inverse of _PARAM_KEYS.
+_PARAM_NAMES = {dst: src for src, dst in _PARAM_KEYS.items()}
+
+
+def preset_with_values(raw: dict, values: dict) -> dict:
+    """A copy of stored preset `raw` with `values` applied.
+
+    Everything else in the entry -- max tokens, system prompt, seed, the
+    reasoning budget, whichever loadConfig keys this manager does not model --
+    comes through untouched, because the chat UI owns them.
+    """
+    out = copy.deepcopy(raw)
+    params = out.get("params")
+    if not isinstance(params, dict):
+        params = out["params"] = {}
+    load = out.get("loadConfig")
+    load = dict(load) if isinstance(load, dict) else {}
+    touched_load = False
+
+    for fld, val in values.items():
+        if fld in SAMPLING_FIELDS:
+            # The UI stores every sampling number as a float, topK included.
+            params[_PARAM_NAMES[fld]] = None if val is None else float(val)
+            if fld == "min_p" and val is not None:
+                # "server-default" makes the UI ignore minP entirely.
+                params["minPMode"] = "custom"
+            continue
+        touched_load = True
+        if fld == "ctx":
+            load["customContextLength"] = int(val) if val else None
+            load["maxSeqLength"] = None
+        elif fld == "spec_mode":
+            # The UI stores null, not "auto", for "let Unsloth decide".
+            load["speculativeType"] = val if val and val != "auto" else None
+        elif fld == "tensor_parallel":
+            load["tensorParallel"] = bool(val)
+        elif fld == "vision":
+            load["disableVision"] = val is False
+        elif fld in _PLAIN_LOAD_KEYS:
+            load[_PLAIN_LOAD_KEYS[fld][1]] = val
+    if touched_load:
+        out["loadConfig"] = load
+    return out
+
+
+def override_load_values(ov: "ModelOverride") -> dict:
+    """What a stored override supplies for each PROFILE_LOAD_FIELDS entry, in
+    Launch terms, for a before/after readout."""
+    return {
+        "ctx": reload_context(ov) or 0,
+        "kv_cache_dtype": ov.kv_cache_dtype,
+        "spec_mode": ov.speculative_type,
+        "spec_draft_n_max": ov.spec_draft_n_max,
+        "parallel": ov.n_parallel,
+        "n_batch": ov.n_batch,
+        "n_ubatch": ov.n_ubatch,
+        "tensor_parallel": ov.tensor_parallel,
+        "vision": False if ov.disable_vision else None,
+    }
+
+
+def preset_values(p: "Preset") -> dict:
+    """Load fields and sampling a stored preset supplies, in Launch terms."""
+    out = {
+        "ctx": p.effective_context or 0,
+        "kv_cache_dtype": p.kv_cache_dtype,
+        "spec_mode": p.speculative_type,
+        "spec_draft_n_max": p.spec_draft_n_max,
+        "parallel": p.n_parallel,
+        "n_batch": p.n_batch,
+        "n_ubatch": p.n_ubatch,
+        "tensor_parallel": p.tensor_parallel,
+        "vision": False if p.disable_vision else None,
+    }
+    out.update({k: p.sampling.get(k) for k in SAMPLING_FIELDS})
+    return out
+
+
+def parse_preset(entry: dict) -> "Preset | None":
+    """A stored preset entry as a Preset -- for reading back what a save wrote."""
+    return _preset_from_json(entry) if isinstance(entry, dict) else None
+
+
+def parse_override(key: str, row: dict) -> "ModelOverride":
+    """A stored override row as a ModelOverride -- for reading back a save."""
+    return _override_from_json(key, row) if isinstance(row, dict) and row \
+        else ModelOverride()

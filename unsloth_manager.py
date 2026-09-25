@@ -34,8 +34,10 @@ readout pick it up. Override with --api-key or UNSLOTH_MGR_API_KEY.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import grp
+import io
 import json
 import os
 import pwd
@@ -47,6 +49,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import NoReturn
@@ -124,7 +127,7 @@ def _default_studio_home() -> str:
     try:
         return os.path.join(pwd.getpwnam(RUN_USER).pw_dir, ".unsloth", "studio")
     except KeyError:
-        return "/home/unsloth/.unsloth/studio"
+        return f"/home/{RUN_USER}/.unsloth/studio"
 
 
 STUDIO_HOME = _STUDIO_HOME_OVERRIDE or _default_studio_home()
@@ -179,6 +182,11 @@ UNSLOTH_BIN = _env("UNSLOTH_MGR_BIN", "unsloth")
 
 # Key used only by `test` / `benchmark` to talk to a running server.
 API_KEY = _env("UNSLOTH_MGR_API_KEY", "")
+
+# Hugging Face token for gated repos, handed to the child as HF_TOKEN. Its own
+# name because local.env only admits UNSLOTH_MGR_*: a plain HF_TOKEN in the
+# real environment is still passed through, and wins.
+HF_TOKEN = _env("UNSLOTH_MGR_HF_TOKEN", "")
 
 STOP_TIMEOUT_SEC = int(_env("UNSLOTH_MGR_STOP_TIMEOUT", "30"))
 LOAD_TIMEOUT_SEC = int(_env("UNSLOTH_MGR_LOAD_TIMEOUT", "900"))
@@ -298,8 +306,6 @@ def _reap_children():
     try:
         while os.waitpid(-1, os.WNOHANG)[0]:
             pass
-    except ChildProcessError:
-        pass
     except OSError:
         pass
 
@@ -501,14 +507,19 @@ def cmd_keepalive(args):
         else:
             try:
                 model_id = _served_model_id_quiet(port, key, m.repo_id)
+                model_id = model_id and _request_model_id(model_id, entry)
                 if model_id:
                     body = json.dumps({
                         "model": model_id,
                         "messages": [{"role": "user", "content": "ping"}],
                         "max_tokens": 1,
                         # Never let a keepalive drag Unsloth's tool machinery
-                        # in: it would serialise /v1 behind this ping.
+                        # in: it would serialise /v1 behind this ping. A
+                        # server launched with tools on overrides
+                        # enable_tools; only tool_choice "none" turns the
+                        # loop off there.
                         "enable_tools": False,
+                        "tool_choice": "none",
                     }).encode()
                     with _http(f"http://127.0.0.1:{port}/v1/chat/completions",
                                method="POST", data=body, api_key=key,
@@ -581,7 +592,10 @@ def _launch_namespace(member: dict) -> argparse.Namespace:
     ns = dict(LAUNCH_DEFAULTS)
     ns.update({k: v for k, v in member.items() if k in LAUNCH_DEFAULTS})
     # Not saved: these are per-invocation, not part of the group's identity.
-    ns.update(api_key="", dry_run=False, force=False, wait=None)
+    # save_profile above all: a restore that re-saved on every reboot would
+    # overwrite whatever the profile has been edited to since.
+    ns.update(api_key="", dry_run=False, force=False, wait=None,
+              save_profile=False)
     return argparse.Namespace(**ns)
 
 
@@ -718,7 +732,8 @@ def _n_gpus() -> int:
 
 
 def _managed_pids() -> set[int]:
-    """Every pid this manager owns, plus their process-group children."""
+    """Every server pid this manager owns. Their children are matched by
+    process group in _gpu_usage_split, not listed here."""
     pids = set()
     for e in _get_running().values():
         pid = int(e.get("pid", 0))
@@ -990,6 +1005,11 @@ class Launch:
         return ml.native_context(self.model, self.variant)
 
 
+# The servers' PATH -- fixed, not root's -- which is also where a bare
+# UNSLOTH_BIN is looked up, since Popen searches the child's environment.
+CHILD_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
 def _child_env(gpus: str, extra_env: dict[str, str], home: str) -> dict[str, str]:
     """A clean environment for the server, not root's inherited one."""
     env = {
@@ -997,7 +1017,7 @@ def _child_env(gpus: str, extra_env: dict[str, str], home: str) -> dict[str, str
         "USER": RUN_USER,
         "LOGNAME": RUN_USER,
         "SHELL": "/usr/bin/bash",
-        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "PATH": CHILD_PATH,
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "HF_HOME": HF_HOME,
         # Our stdout is a log file, not a tty, so CPython would block-buffer
@@ -1014,6 +1034,8 @@ def _child_env(gpus: str, extra_env: dict[str, str], home: str) -> dict[str, str
     # See the STUDIO_HOME comment: only a deliberate override is exported.
     if _STUDIO_HOME_OVERRIDE:
         env["UNSLOTH_STUDIO_HOME"] = _STUDIO_HOME_OVERRIDE
+    if HF_TOKEN:
+        env["HF_TOKEN"] = HF_TOKEN
     for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NO_PROXY", "no_proxy"):
         if os.environ.get(key):
             env[key] = os.environ[key]
@@ -1367,7 +1389,9 @@ def _print_effective(port: int, log_path: str, api_key: str = "",
                  "f16 (default)"),
                 ("speculative", spec, want.get("spec"), "auto"),
                 ("slots", slots, want.get("parallel"), "default")):
-            if ours is None:
+            # "" is how `start` records a speculative mode it never set, so it
+            # is "no claim", not a claim that the server must match.
+            if ours is None or ours == "":
                 continue
             shown = live if live is not None else gone
             if str(shown) != str(ours):
@@ -1431,6 +1455,23 @@ def _served_models(port: int, api_key: str) -> list:
     if not models:
         _die("server reported no models on /v1/models")
     return models
+
+
+def _request_model_id(model_id: str, entry: dict) -> str:
+    """The id to put in a request: `model_id` pinned to the launched quant.
+
+    /v1/models lists only the bare repo id, but naming it on an idle-unloaded
+    server lets Studio reload whichever quant it prefers -- and a quant with no
+    saved override loads on estimator defaults. Seen on Qwen3.8-27B: launched
+    Q4_K_L / q8_0 KV / 262k, a bare-id reload came back Q4_K_M / f16 KV / 210k
+    and ran GPU0 out of memory on the first long prompt. `repo:QUANT` makes the
+    reload pick our quant and its override; on a loaded server it is served by
+    the resident model without a reload (verified).
+    """
+    variant = (entry or {}).get("variant") or ""
+    if not variant or ":" in model_id:
+        return model_id
+    return f"{model_id}:{variant}"
 
 
 def _served_model_id(port: int, api_key: str, repo_id: str = "") -> str:
@@ -1616,6 +1657,13 @@ def _apply_load_profile(lb: Launch, args) -> None:
             if val is not None:
                 setattr(lb, name, val)
                 lb.sources[name] = "preset"
+        # Read like the override's: without it a preset saying "vision off"
+        # launched with the projector attached, and the first idle reload --
+        # which reads the override, where the same choice usually lives too --
+        # took it away again.
+        if p.disable_vision:
+            lb.vision = False
+            lb.sources["vision"] = "preset"
 
 
 def _resolve_launch(m: ml.ModelInfo, args) -> Launch:
@@ -1691,7 +1739,8 @@ def _fmt_ctx(n: int | None) -> str:
     return f"{n:,}" if n < 1000 else f"{n:,} ({n / 1024:.0f}k)"
 
 
-def _reload_drift(lb: Launch) -> list[tuple[str, str, str]]:
+def _reload_drift(lb: Launch,
+                  ov: up.ModelOverride | None = None) -> list[tuple[str, str, str]]:
     """Fields a Studio idle-reload would restore differently from this launch.
 
     Idle auto-unload frees the GGUF and the next request reloads it -- but the
@@ -1700,11 +1749,14 @@ def _reload_drift(lb: Launch) -> list[tuple[str, str, str]]:
     the override does not also carry is dropped the first time the server sits
     idle, silently and without a restart.
 
+    `ov` compares against an override other than the stored one -- the row a
+    pending profile save is about to write.
+
     Returns (field, "what we launched with", "what a reload restores").
     """
     if not up.idle_unload_seconds(STUDIO_DB):
         return []                      # nothing ever reloads it out from under us
-    ov = lb.override
+    ov = lb.override if ov is None else ov
     labels = {"ctx": "context", "kv_cache_dtype": "kv cache",
               "spec_mode": "speculative", "spec_draft_n_max": "draft-n-max",
               "parallel": "slots", "n_batch": "batch", "n_ubatch": "ubatch",
@@ -1741,27 +1793,39 @@ def _reload_drift(lb: Launch) -> list[tuple[str, str, str]]:
 
     # Vision is its own flag, and Unsloth only ever stores the OFF direction:
     # an override with no disable_vision means a reload reattaches the mmproj.
-    # Both directions are drift, so compare what each side actually yields.
-    if lb.vision is not None:
+    # Both directions are drift, so compare what each side actually yields --
+    # and a launch that left vision unset yields ON, because Unsloth attaches a
+    # projector it finds on its own. Skipping that case is how a preset launch
+    # ran with the mmproj for hours and then lost it to an idle reload unseen.
+    # With no projector on disk the two sides are the same server.
+    if ml.has_mmproj(lb.model):
+        ours = lb.vision is not False
         reload_vision = not ov.disable_vision
-        if lb.vision != reload_vision:
+        if ours != reload_vision:
             drift.append(("vision",
-                          "on" if lb.vision else "off",
+                          ("on" if lb.vision else "on (Unsloth default)")
+                          if ours else "off",
                           "on (mmproj reattached)" if reload_vision else "off"))
     return drift
 
 
-def _print_reload_note(lb: Launch) -> None:
-    """Say what an idle reload will do, whenever it can do something else."""
+def _print_reload_note(lb: Launch, after: up.ModelOverride | None = None) -> None:
+    """Say what an idle reload will do, whenever it can do something else.
+
+    `after` is the override as a pending profile save will leave it, which is
+    what every reload from then on reads.
+    """
     ttl = up.idle_unload_seconds(STUDIO_DB)
     if not ttl:
         return
-    drift = _reload_drift(lb)
+    drift = _reload_drift(lb, after)
     mins = f"{ttl // 60}m" if ttl % 60 == 0 else f"{ttl}s"
     if not drift:
         print(f"\n    idle reload: after {mins} idle Unsloth frees this model and "
-              f"reloads it\n                 from studio.db — which matches this "
-              f"launch, so nothing changes.")
+              f"reloads it\n                 from studio.db — which "
+              + ("will match this launch once the profile save lands."
+                 if after is not None else
+                 "matches this launch, so nothing changes."))
         return
     print(f"\n    idle reload: WARNING — after {mins} idle Unsloth frees this "
           f"model and reloads\n                 it from studio.db, not from this "
@@ -1849,6 +1913,8 @@ def _load_report(m: ml.ModelInfo, variant: str,
         if preset.tensor_parallel is not None:
             bits.append("tensor-parallel" if preset.tensor_parallel
                         else "no tensor-parallel")
+        if preset.disable_vision:
+            bits.append("vision off")
         out.append(f"      studio preset    : {preset.name} — {', '.join(bits)}")
         out.append(f"        sampling       : "
                    f"{up.fmt_sampling(preset.sampling) or 'model defaults'}")
@@ -1906,10 +1972,13 @@ def _manager_cli(args, lb: Launch) -> str:
             out.append(f"--{key.replace('_', '-')} {val}")
     for extra in (getattr(args, "extra", None) or []):
         out.append(f"--extra={extra}")
+    if getattr(args, "save_profile", False):
+        out.append("--save-profile")
     return " ".join(out)
 
 
-def _print_launch_plan(lb: Launch, argv: list[str], args=None) -> None:
+def _print_launch_plan(lb: Launch, argv: list[str], args=None,
+                       save: "ProfileSave | None" = None) -> None:
     """What this launch will actually do, before it does it."""
     m = lb.model
     native = lb.native_ctx or up.doc_native_context(m.repo_id)
@@ -2001,16 +2070,452 @@ def _print_launch_plan(lb: Launch, argv: list[str], args=None) -> None:
               f"6.8x slower with tools\n                 on than off, and "
               f"single-request throughput was 3.5x lower.\n"
               f"                 Pass --no-tools unless you actually want "
-              f"server-side web/code\n                 execution; clients can "
-              f"still send enable_tools: false per request.")
+              f"server-side web/code\n                 execution. A client's "
+              f"enable_tools: false does NOT opt out\n                 here "
+              f"(the launch policy outranks it); send tool_choice: \"none\".")
 
-    _print_reload_note(lb)
+    after = None
+    if save is not None:
+        _print_save_plan(save, lb)
+        if save.override_values:
+            after = up.parse_override(save.override_key, up.override_payload(
+                save.override_key, save.override_raw, save.override_values))
+    _print_reload_note(lb, after)
 
     for note in lb.notes:
         print(f"    note    : {note}")
     print(f"\n    $ {' '.join(argv)}")
     if args is not None:
         print(f"\n    this launch as a command:\n      {_manager_cli(args, lb)}")
+
+
+# =============================================================================
+# PROFILE SAVE
+# =============================================================================
+# `start --save-profile`, and the Save action on the TUI's review screen, write
+# the values a launch was given back into the profile they came from, so the
+# next start of this model -- and the next idle reload -- come back on them.
+#
+# Routing is per field, by where the field came from:
+#   * load fields from a Studio preset -> that preset, AND the quant's
+#     per-model override, because an idle reload reads only the override;
+#   * load fields under --load-profile auto/override -> the quant's override;
+#   * sampling from a Studio preset -> that preset (overrides hold none);
+#   * anything else -- sampling from the published docs table or from
+#     Unsloth's own defaults, load fields under --load-profile none -- has no
+#     profile to go back to. It stays on this instance only: a flag in its
+#     saved answers, which restart and instance groups replay and nothing
+#     else sees. The launch says so rather than pretending it was saved.
+#
+# The write goes through Studio's own settings API, never into studio.db, and
+# it happens after the model has loaded, through the new server itself. The
+# API needs a live server and its key, and the key is printed only once the
+# load completes. The side effect is the useful one: a profile is never
+# rewritten with settings that failed to load.
+
+# Launch field -> the `start` argument that sets it.
+_EDIT_ARGS = {**{f: f for f in up.PROFILE_LOAD_FIELDS},
+              "spec_mode": "spec",
+              **{k: k for k in up.SAMPLING_FIELDS}}
+
+_FIELD_LABELS = {
+    "ctx": "context", "kv_cache_dtype": "kv cache", "spec_mode": "speculative",
+    "spec_draft_n_max": "draft-n-max", "parallel": "slots", "n_batch": "batch",
+    "n_ubatch": "ubatch", "tensor_parallel": "tensor-parallel",
+    "vision": "vision (mmproj)", "temperature": "temperature",
+    "top_p": "top_p", "top_k": "top_k", "min_p": "min_p",
+    "presence_penalty": "presence pen.",
+    "repetition_penalty": "repetition pen.",
+}
+
+
+def _norm_value(fld: str, val):
+    """A value with every spelling of "Unsloth's default" collapsed, so a
+    profile holding nothing and one holding the default compare equal."""
+    if fld == "ctx":
+        return int(val or 0)
+    if fld == "spec_mode":
+        return val or "auto"
+    if fld == "tensor_parallel":
+        return bool(val)
+    if fld == "vision":
+        return val is not False
+    if fld == "kv_cache_dtype":
+        return val or "f16"
+    if fld in up.SAMPLING_FIELDS and val is not None:
+        return float(val)
+    return val
+
+
+def _fmt_value(fld: str, val) -> str:
+    """One field's value for a readout, naming the default when unset."""
+    if fld == "ctx":
+        return "fit-max" if not val else _fmt_ctx(int(val))
+    if fld == "spec_mode":
+        return val or "auto"
+    if fld == "kv_cache_dtype":
+        return val or "f16 (default)"
+    if fld == "tensor_parallel":
+        return "on" if val else "off"
+    if fld == "vision":
+        return "off" if val is False else ("on" if val else "on (default)")
+    if val is None:
+        return "default"
+    if fld in up.INT_FIELDS:
+        return str(int(val))
+    return str(val)
+
+
+@dataclass
+class ProfileSave:
+    """Where an explicit save sends each value, decided before the launch."""
+    preset: str = ""                     # preset to write, "" = none
+    preset_raw: dict | None = None       # the entry as the plan read it
+    preset_values: dict = field(default_factory=dict)   # field -> new value
+    preset_old: dict = field(default_factory=dict)
+    override_key: str = ""               # override to write, "" = none
+    override_raw: dict = field(default_factory=dict)    # the row as read
+    override_values: dict = field(default_factory=dict)
+    override_old: dict = field(default_factory=dict)
+    # field -> the target whose write makes its flag redundant ("preset" or
+    # "override"). A field whose target already holds the value is here too:
+    # there is nothing to write, and it is saved all the same.
+    needs: dict = field(default_factory=dict)
+    instance_only: dict = field(default_factory=dict)   # field -> value
+    why_instance: dict = field(default_factory=dict)    # field -> reason
+    notes: list = field(default_factory=list)
+
+    @property
+    def writes(self) -> bool:
+        return bool(self.preset_values or self.override_values)
+
+    def targets(self, variant: str = "") -> str:
+        """The profiles this save writes, in words."""
+        bits = []
+        if self.preset:
+            bits.append(f'preset "{self.preset}"')
+        if self.override_key:
+            bits.append(f"the {variant} override" if variant
+                        else "the per-model override")
+        return " + ".join(bits)
+
+
+def _override_target_key(lb: Launch) -> str:
+    """The per-quant key a save writes: `repo:QUANT`, the way the Studio
+    settings page keys it, keeping a stored row's own spelling when one
+    already answers for it."""
+    want = (f"{lb.model.repo_id}:{lb.variant}" if lb.variant
+            else lb.model.repo_id)
+    if lb.override and lb.override.key.casefold() == want.casefold():
+        return lb.override.key
+    return want
+
+
+def _save_route(lb: Launch, load_profile: str, fld: str) -> tuple[str, str]:
+    """Where a save sends one field: ("preset" | "override", "") when a
+    profile can hold it, or ("", why) when there is nothing to save it into.
+    The review screen names the same routes up front, so this is the one
+    place the rule lives."""
+    if fld in up.SAMPLING_FIELDS:
+        if lb.sampling_source == "preset" and lb.preset:
+            return "preset", ""
+        if lb.sampling_source == "docs" and lb.doc:
+            return "", (f"docs {lb.doc.label}/{lb.doc.mode} is Unsloth's "
+                        f"published table, not a saved profile")
+        return "", f"--sampling {lb.sampling_source} reads no saved profile"
+    if lb.preset is not None and lb.load_source.startswith("preset "):
+        return "preset", ""
+    if load_profile in ("auto", "override"):
+        return "override", ""
+    return "", f"--load-profile {load_profile} reads no profile"
+
+
+def _profile_save_plan(lb: Launch, args) -> ProfileSave:
+    """Route every explicitly given value to the profile that should hold it.
+
+    An explicit value is one passed as a `start` flag -- which is what the
+    TUI's review screen turns an edit into.
+    """
+    plan = ProfileSave()
+    edits = {}
+    for fld, arg in _EDIT_ARGS.items():
+        given = getattr(args, arg, None)
+        if given is None or given == "":
+            continue
+        # The resolved value, not the raw flag: --spec is parsed, top_k made
+        # an int, and so on.
+        edits[fld] = (lb.sampling.get(fld) if fld in up.SAMPLING_FIELDS
+                      else getattr(lb, fld))
+
+    lp = (getattr(args, "load_profile", None) or "auto").strip().lower()
+    from_preset = lb.preset is not None and lb.load_source.startswith("preset ")
+    to_preset: dict = {}
+
+    for fld, val in edits.items():
+        target, why = _save_route(lb, lp, fld)
+        if target:
+            plan.needs[fld] = target
+            if target == "preset":
+                to_preset[fld] = val
+        else:
+            plan.instance_only[fld] = val
+            plan.why_instance[fld] = why
+
+    if to_preset:
+        plan.preset = lb.preset.name
+        plan.preset_raw = up.raw_preset(STUDIO_DB, lb.preset.name)
+        old = up.preset_values(lb.preset)
+        plan.preset_old = {f: old.get(f) for f in to_preset}
+        plan.preset_values = {
+            f: v for f, v in to_preset.items()
+            if _norm_value(f, v) != _norm_value(f, old.get(f))}
+
+    # The override is what an idle reload -- and a /v1 auto-switch -- rebuild
+    # the model from. Whenever anything goes back to Studio and a profile is
+    # in play, it is made to reproduce THIS launch's load config in full: an
+    # edit saved only to the preset would otherwise be undone five minutes
+    # into the first idle spell.
+    to_override = any(t == "override" for t in plan.needs.values())
+    if lp != "none" and (to_preset or to_override):
+        plan.override_key = _override_target_key(lb)
+        ov = lb.override
+        plan.override_raw = up.raw_override(STUDIO_DB, ov.key) if ov else {}
+        old = up.override_load_values(ov)
+        new = {f: getattr(lb, f) for f in up.PROFILE_LOAD_FIELDS}
+        # A drafter depth under a mode that has no drafter is dropped by
+        # Studio on save; comparing it would report a change that cannot land.
+        if _norm_value("spec_mode", new["spec_mode"]) not in up.DRAFT_N_MAX_MODES:
+            new["spec_draft_n_max"] = old["spec_draft_n_max"]
+        plan.override_old = old
+        plan.override_values = {
+            f: v for f, v in new.items()
+            if _norm_value(f, v) != _norm_value(f, old[f])}
+        if not plan.override_values and not to_override:
+            plan.override_key = ""          # nothing to sync, nothing to say
+        elif lp == "auto" and from_preset and not ov:
+            plan.notes.append(
+                f"--load-profile auto reads a per-model override before the "
+                f"preset, so from now on this quant loads from "
+                f"{plan.override_key} (which this save makes identical)")
+    return plan
+
+
+def _print_save_plan(save: ProfileSave, lb: Launch) -> None:
+    """The profile-save half of the launch plan."""
+    print("\n    profile save: after the model loads, through Studio's own "
+          "settings API")
+    if not save.writes and not save.instance_only:
+        print("      nothing to write — every value already matches its "
+              "profile")
+
+    def rows(values: dict, old: dict):
+        for fld, val in values.items():
+            print(f"        {_FIELD_LABELS[fld]:<16}"
+                  f"{_fmt_value(fld, old.get(fld)):<18}->  "
+                  f"{_fmt_value(fld, val)}")
+
+    if save.preset_values:
+        print(f'      preset "{save.preset}"')
+        rows(save.preset_values, save.preset_old)
+    if save.override_values:
+        print(f"      override {save.override_key}"
+              + ("   (new)" if not save.override_raw else "")
+              + "   — what an idle reload rebuilds from")
+        rows(save.override_values, save.override_old)
+    held = [f for f, t in save.needs.items()
+            if f not in save.preset_values and f not in save.override_values]
+    if held:
+        print(f"      already held  : "
+              f"{', '.join(_FIELD_LABELS[f] for f in held)} "
+              f"(the profile has that value)")
+    if save.instance_only:
+        print("      NOT SAVED — no profile to save into; kept on this "
+              "instance only:")
+        for fld, val in save.instance_only.items():
+            print(f"        {_FIELD_LABELS[fld]:<16}{_fmt_value(fld, val):<18}"
+                  f"{save.why_instance.get(fld, '')}")
+        print(f"        restart and instance groups replay these; any other "
+              f"launch of {lb.model.repo_id}\n        will not see them.")
+    for note in save.notes:
+        print(f"      note          : {note}")
+
+
+class _StudioError(Exception):
+    pass
+
+
+def _studio_json(port: int, api_key: str, path: str, body: dict | None = None,
+                 method: str = "") -> dict:
+    """One call to a managed server's own API, as JSON, or _StudioError."""
+    data = None if body is None else json.dumps(body).encode()
+    try:
+        with _http(f"http://127.0.0.1:{port}{path}",
+                   method=method or ("GET" if data is None else "POST"),
+                   data=data, api_key=api_key, timeout=15.0) as r:
+            out = json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read().decode()).get("detail") or ""
+        except (OSError, ValueError, AttributeError):
+            pass
+        raise _StudioError(f"HTTP {e.code}"
+                           + (f": {str(detail)[:200]}" if detail else "")) from None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise _StudioError(str(getattr(e, "reason", e))) from None
+    if not isinstance(out, dict):
+        raise _StudioError("unexpected response")
+    return out
+
+
+def _unkept(want: dict, got: dict) -> list[str]:
+    """Fields Studio did not store as sent: its normaliser drops what it
+    cannot use rather than refusing the save, so a 200 alone proves little."""
+    return [f"{_FIELD_LABELS[f]} (sent {_fmt_value(f, v)}, stored "
+            f"{_fmt_value(f, got.get(f))})"
+            for f, v in want.items()
+            if _norm_value(f, v) != _norm_value(f, got.get(f))]
+
+
+def _save_preset(save: ProfileSave, port: int, api_key: str) -> bool:
+    label = f'preset "{save.preset}"'
+    try:
+        cur = _studio_json(port, api_key, "/api/chat/settings")
+        presets = (cur.get("settings") or {}).get("customPresets")
+        if not isinstance(presets, list):
+            raise _StudioError("Studio returned no presets")
+        idx = next((i for i, p in enumerate(presets)
+                    if isinstance(p, dict) and p.get("name") == save.preset),
+                   None)
+        if idx is None:
+            raise _StudioError("it no longer exists (renamed or deleted in "
+                               "Studio since this launch read it)")
+        # Someone else's edit since the launch read it must not be silently
+        # overwritten with this launch's copy of the older one.
+        if save.preset_raw is not None and presets[idx] != save.preset_raw:
+            raise _StudioError("it was changed in Studio since this launch "
+                               "read it; nothing was overwritten")
+        new = list(presets)
+        new[idx] = up.preset_with_values(presets[idx], save.preset_values)
+        # Compare-and-set: applied only if the list is still what was just
+        # read, all inside one Studio transaction.
+        resp = _studio_json(port, api_key, "/api/chat/settings/compare-and-set",
+                            {"expected": {"customPresets": presets},
+                             "patch": {"customPresets": new}})
+        if not resp.get("applied"):
+            raise _StudioError("Studio's presets changed mid-save; nothing "
+                               "was written")
+    except _StudioError as e:
+        print(f"    {label}: NOT saved — {e}")
+        return False
+    stored = next((p for p in (resp.get("settings") or {}).get("customPresets")
+                   or [] if isinstance(p, dict) and p.get("name") == save.preset),
+                  None)
+    parsed = up.parse_preset(stored) if stored else None
+    lost = _unkept(save.preset_values, up.preset_values(parsed)) if parsed \
+        else ["(could not read the preset back)"]
+    print(f"    {label}: saved "
+          f"{', '.join(_FIELD_LABELS[f] for f in save.preset_values)}")
+    if lost:
+        print(f"      Studio did not keep: {'; '.join(lost)}")
+    return not lost
+
+
+def _override_query(key: str) -> str:
+    return ("/api/settings/openai-auto-switch/overrides?model_id="
+            + urllib.parse.quote(key, safe=""))
+
+
+def _save_override(save: ProfileSave, port: int, api_key: str) -> bool:
+    label = f"override {save.override_key}"
+    try:
+        cur = _studio_json(port, api_key, _override_query(save.override_key))
+        row = cur.get("resolved") or {}
+        # The same guard as the preset's, and a second one for free: if
+        # Studio resolves this quant to a different row than the manager read
+        # (an alias spelling, say), the rows differ and nothing is written.
+        if row != save.override_raw:
+            raise _StudioError(
+                f"the row Studio loads this quant from "
+                f"({cur.get('resolved_key') or 'none'}) is not the one this "
+                f"launch read; nothing was overwritten")
+        # A PUT replaces the whole row, so the payload is the stored row with
+        # only the changed fields swapped in.
+        _studio_json(port, api_key, "/api/settings/openai-auto-switch/overrides",
+                     up.override_payload(save.override_key, row,
+                                         save.override_values), method="PUT")
+        after = _studio_json(port, api_key, _override_query(save.override_key))
+    except _StudioError as e:
+        print(f"    {label}: NOT saved — {e}")
+        return False
+    got = up.override_load_values(up.parse_override(
+        after.get("resolved_key") or "", after.get("resolved") or {}))
+    lost = _unkept(save.override_values, got)
+    print(f"    {label}: saved "
+          f"{', '.join(_FIELD_LABELS[f] for f in save.override_values)}")
+    if lost:
+        print(f"      Studio did not keep: {'; '.join(lost)}")
+    return not lost
+
+
+def _run_profile_save(save: ProfileSave, lb: Launch, port: int,
+                      api_key: str) -> set[str]:
+    """Write the plan through the server on `port`. Returns the fields whose
+    profile now holds them, i.e. whose flag the instance no longer needs."""
+    print("\n  Profile save\n")
+    ok = {"preset": True, "override": True}   # nothing to write = nothing failed
+    if save.writes and not api_key:
+        print("    NOT saved — no API key in the server log to call Studio's "
+              "settings API with.")
+        ok = {"preset": not save.preset_values,
+              "override": not save.override_values}
+    else:
+        if save.preset_values:
+            ok["preset"] = _save_preset(save, port, api_key)
+        if save.override_values:
+            ok["override"] = _save_override(save, port, api_key)
+    if not save.writes and save.needs:
+        print("    nothing to write — the profile already holds every value")
+    if not ok["override"] and save.override_values:
+        drift = _reload_drift(lb)
+        if drift:
+            print("      so an idle reload still restores: "
+                  + ", ".join(f"{f} {theirs}" for f, _o, theirs in drift))
+    if save.instance_only:
+        print("    instance only (no profile to save into): "
+              + ", ".join(f"{_FIELD_LABELS[f]} {_fmt_value(f, v)}"
+                          for f, v in save.instance_only.items()))
+    return {f for f, target in save.needs.items() if ok[target]}
+
+
+def _forget_saved_flags(repo_id: str, fields: set[str]) -> None:
+    """Drop the now-redundant flags from a running instance's saved answers,
+    so restart and instance groups read those values from the profile --
+    where a later edit in Studio can still change them -- instead of freezing
+    this launch's copy."""
+    if not fields:
+        return
+    st, _ = _prune_dead(_load_state())
+    entry = st["models"].get(repo_id)
+    if not entry:
+        return
+    answers = dict(entry.get("launch_args") or {})
+    for fld in fields:
+        arg = _EDIT_ARGS[fld]
+        answers[arg] = LAUNCH_DEFAULTS.get(arg)
+    entry["launch_args"] = answers
+    _save_state(st)
+
+
+def _print_save_skipped(save: "ProfileSave | None", why: str,
+                        kept: bool = True) -> None:
+    """A requested save that did not happen, and where the values are now."""
+    if save is None or not (save.needs or save.instance_only):
+        return
+    print(f"\n  Profile save: NOT done — {why}. No profile was changed.")
+    if kept:
+        print("    The edited values stay on this instance only: its saved "
+              "answers, which restart\n    and instance groups replay.")
 
 
 # =============================================================================
@@ -2038,8 +2543,9 @@ def cmd_doctor(args):
     except SystemExit:
         report(f"user {RUN_USER} exists", False)
 
-    report("unsloth CLI on PATH", _has_command(UNSLOTH_BIN),
-           shutil.which(UNSLOTH_BIN) or "not found")
+    cli = shutil.which(UNSLOTH_BIN, path=CHILD_PATH)
+    report("unsloth CLI on the servers' PATH", bool(cli),
+           cli or f"{UNSLOTH_BIN!r} not found; set UNSLOTH_MGR_BIN to its full path")
     report("STUDIO_HOME exists", os.path.isdir(STUDIO_HOME), STUDIO_HOME)
     # An override that is not its own realpath re-creates the re-exec loop:
     # Unsloth resolves UNSLOTH_STUDIO_HOME but compares it to an unresolved
@@ -2088,6 +2594,11 @@ def cmd_doctor(args):
           f"({MAX_INSTANCES} instance{'s' if MAX_INSTANCES != 1 else ''} max)")
     print(f"    api key       : "
           f"{'set via UNSLOTH_MGR_API_KEY' if API_KEY else 'not set (read from each server log)'}")
+    hf_src = next((k for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+                   if os.environ.get(k)),
+                  "UNSLOTH_MGR_HF_TOKEN" if HF_TOKEN else "")
+    print(f"    hf token      : "
+          f"{f'set via {hf_src}' if hf_src else 'not set (public repos only)'}")
 
     print("\n  " + ("All checks passed." if ok else "Some checks failed.") + "\n")
     if not ok:
@@ -2155,6 +2666,10 @@ def cmd_start(args):
         _die(f"{m.repo_id} has no weights on disk (incomplete download). "
              f"Re-download it before serving.")
     lb = _resolve_launch(m, args)
+    # Decided now, against what studio.db holds at launch time; written only
+    # once the model has loaded (see PROFILE SAVE).
+    save = (_profile_save_plan(lb, args)
+            if getattr(args, "save_profile", False) else None)
 
     state, _ = _prune_dead(_load_state())
 
@@ -2225,14 +2740,15 @@ def cmd_start(args):
     argv = _build_cmd(lb)
     log_path = _log_path(m.repo_id)
 
-    _print_launch_plan(lb, argv, args)
+    _print_launch_plan(lb, argv, args, save)
     print(f"    log     : {log_path}")
     # Before the rotate, not after: --dry-run must touch nothing. Rotating here
     # would rename a RUNNING server's log out from under it -- the server keeps
     # writing to the renamed inode, so `logs` finds nothing and the readout
     # loses the API key it reads from that file.
     if getattr(args, "dry_run", False):
-        print("\n  --dry-run: nothing started.\n")
+        print("\n  --dry-run: nothing started"
+              + (", nothing saved" if save is not None else "") + ".\n")
         return
     _rotate_log(log_path)
 
@@ -2255,6 +2771,7 @@ def cmd_start(args):
     if proc.poll() is not None and not _pid_alive(pid):
         print(f"\n  Server exited immediately (status {proc.returncode}).")
         _print_log_tail(log_path, 30)
+        _print_save_skipped(save, "the server never started", kept=False)
         sys.exit(1)
 
     # Enough to reproduce this exact server. A restart that silently dropped
@@ -2298,6 +2815,9 @@ def cmd_start(args):
 
     wait = args.wait if args.wait is not None else LOAD_TIMEOUT_SEC
     if wait <= 0:
+        _print_save_skipped(save, "--wait 0 never confirms the load, and "
+                            "Studio's settings API needs the key the server "
+                            "prints once it has loaded")
         print(f"\n  Launched. {_endpoint_url(lb.port)}\n")
         return
 
@@ -2308,6 +2828,9 @@ def cmd_start(args):
             print(" server died.\n")
             _print_log_tail(log_path, 30)
             state, _ = _prune_dead(_load_state())
+            _print_save_skipped(save, "the load failed, and a profile is "
+                                "never rewritten with settings that did not "
+                                "load", kept=False)
             sys.exit(1)
         _READY_CACHE.pop(lb.port, None)
         if _probe_ready(lb.port, timeout=1.0, log_path=log_path):
@@ -2321,6 +2844,11 @@ def cmd_start(args):
                                     entry=state["models"].get(m.repo_id)):
                 print("\n  (could not read back effective settings: no API "
                       "key found in the log)")
+            if save is not None:
+                key = (getattr(args, "api_key", "") or API_KEY
+                       or _log_api_key(log_path))
+                _forget_saved_flags(m.repo_id,
+                                    _run_profile_save(save, lb, lb.port, key))
             if lb.keep_warm:
                 kp = _spawn_keepalive(m.repo_id)
                 if kp:
@@ -2349,6 +2877,7 @@ def cmd_start(args):
     stage = ("serving, but the model has not finished loading" if listening
              else "not listening yet")
     print(f"\n\n  Still starting after {wait}s ({stage}); leaving it running.")
+    _print_save_skipped(save, "the load was not confirmed in time")
     print(f"  Follow with: python {os.path.basename(__file__)} "
           f"logs {m.repo_id} -f\n")
 
@@ -2473,10 +3002,20 @@ def cmd_restart(args):
                 tools=getattr(args, "tools", None),
                 keep_warm=getattr(args, "keep_warm", None),
                 load_profile=getattr(args, "load_profile", None))
+    answers: dict = {}
     if key in running:
         e = running[key]
+        # Every explicit value the server was started with -- a context pin, a
+        # sampling pin kept on the instance because it had no profile to be
+        # saved into, extra args -- lives in its saved answers, the same ones
+        # an instance group replays. The profile choices below alone would
+        # bring it back without any of them.
+        answers = dict(e.get("launch_args") or {})
         if plan["preset"] is None:
-            plan["preset"] = e.get("preset") or None
+            # The stored answer first: "none" recorded as "" in the entry
+            # would read back as "no flag", and a restart would then pick up
+            # whatever preset the Studio UI has selected today.
+            plan["preset"] = answers.get("preset") or e.get("preset") or None
         if plan["port"] is None:
             plan["port"] = int(e["port"])
         for name, stored in (("gpus", "gpus"), ("variant", "variant")):
@@ -2494,14 +3033,18 @@ def cmd_restart(args):
         cmd_stop(argparse.Namespace(model=key))
         time.sleep(1.5)
 
-    cmd_start(argparse.Namespace(
-        model=key, wait=args.wait, force=False, dry_run=False, api_key="",
-        sampling=plan["sampling"] or "docs",
-        mode=plan["mode"] or up.DEFAULT_DOC_MODE,
-        load_profile=plan["load_profile"] or "auto",
-        tools=plan["tools"], keep_warm=bool(plan["keep_warm"]),
-        preset=plan["preset"], port=plan["port"], gpus=plan["gpus"],
-        variant=plan["variant"]))
+    ns = _launch_namespace({**answers, "model": key})
+    ns.wait = args.wait
+    ns.sampling = plan["sampling"] or "docs"
+    ns.mode = plan["mode"] or up.DEFAULT_DOC_MODE
+    ns.load_profile = plan["load_profile"] or "auto"
+    ns.tools = plan["tools"]
+    ns.keep_warm = bool(plan["keep_warm"])
+    ns.preset = plan["preset"]
+    ns.port = plan["port"]
+    ns.gpus = plan["gpus"]
+    ns.variant = plan["variant"]
+    cmd_start(ns)
 
 
 def cmd_status(args):
@@ -2619,7 +3162,14 @@ def _stream_completion(port: int, model_id: str, api_key: str, prompt: str,
         # Measure the model, not Unsloth's tool layer: with tools on, the
         # model may stop to run web searches mid-answer, which puts network
         # round-trips into TTFT and serialises /v1 behind this request.
+        #
+        # enable_tools alone is not enough: a server launched with tools on
+        # (--enable-tools) outranks it, forces the tool loop anyway, and then
+        # 400s this streamed request for lacking the X-Unsloth-Events confirm
+        # channel. tool_choice "none" is the per-request switch Studio honours
+        # over that policy.
         "enable_tools": False,
+        "tool_choice": "none",
     }).encode()
 
     start = time.monotonic()
@@ -2718,7 +3268,8 @@ def cmd_test(args):
                         log_path=running[key].get("log", "")):
         _die(f"server on port {port} is not ready yet")
 
-    model_id = _served_model_id(port, api_key, key)
+    model_id = _request_model_id(_served_model_id(port, api_key, key),
+                                 running[key])
     prompt = args.prompt or TEST_PROMPT
 
     print(f"\n  {key}  (served as {model_id})")
@@ -2818,7 +3369,7 @@ def _bench_measure(entry: dict, repo_id: str, api_key: str, max_tokens: int,
     if mine is None:
         _die(f"the server on port {port} does not list {repo_id} on "
              f"/v1/models, so there is no id to ask it for")
-    model_id = mine["id"]
+    model_id = _request_model_id(mine["id"], entry)
 
     # Studio reports "loaded" per entry. An older build that does not is
     # treated as loaded: a reload is then only visible in the log.
@@ -3179,6 +3730,8 @@ def cmd_presets(args):
             load_bits.append(f"kv-cache {p.kv_cache_dtype}")
         if p.spec_draft_n_max:
             load_bits.append(f"draft-n-max {p.spec_draft_n_max}")
+        if p.disable_vision:
+            load_bits.append("vision off")
         print(f"      load    : {', '.join(load_bits) or 'Unsloth defaults'}")
 
         spec = p.speculative_type or "auto"
@@ -3475,40 +4028,15 @@ def _tui_pick_variant(stdscr, repo_id: str):
     return "" if idx == len(names) else names[idx]
 
 
-def _planned_slots(repo_id: str, variant: str, load_profile: str,
-                   preset: str) -> int:
-    """Decode slots this launch will ask for, for the tools warning.
-
-    Cheap re-derivation of what _apply_load_profile would settle on, so the
-    warning can name a real number instead of "your slots". 4 is `unsloth
-    studio run`'s own default when nothing supplies one.
-    """
-    if load_profile in ("auto", "override"):
-        ov = up.model_override(STUDIO_DB, repo_id, variant)
-        if ov.n_parallel:
-            return ov.n_parallel
-        if load_profile == "override":
-            return 4
-    if load_profile in ("auto", "preset"):
-        presets = up.load_presets(STUDIO_DB)
-        p = up.find_preset(presets, preset) if preset not in ("", "none") else None
-        if p is None and preset in ("", "none"):
-            p = presets.get(up.active_preset_name(STUDIO_DB))
-        if p is not None and p.n_parallel:
-            return p.n_parallel
-    return 4
-
-
-def _tui_pick_tools(stdscr, repo_id: str, variant: str, load_profile: str,
-                    preset: str):
+def _tui_pick_tools(stdscr, slots: int):
     """Server-side tools on or off. Returns True/False, or None on cancel.
 
     Asked explicitly rather than left at Unsloth's default because the default
     quietly costs every bit of the concurrency the slot count advertises --
-    measured on this box, not inferred.
+    measured on this box, not inferred. `slots` is the count the launch will
+    really ask for.
     """
     import curses
-    slots = _planned_slots(repo_id, variant, load_profile, preset)
     warn = curses.color_pair(_C_YELLOW) | curses.A_BOLD
     dim = curses.color_pair(_C_DIM)
     header = [
@@ -3617,6 +4145,270 @@ def _tui_pick_profile(stdscr):
     return "preset", "preset", up.DEFAULT_DOC_MODE, preset
 
 
+# The review screen: what a launch will run with, before it runs, editable in
+# place. Batch sizes stay CLI flags -- they rarely matter and would push the
+# fields that do off a small terminal.
+_REVIEW_LOAD = ("ctx", "kv_cache_dtype", "spec_mode", "spec_draft_n_max",
+                "parallel", "vision", "tensor_parallel")
+
+_REVIEW_CHOICES = {
+    "kv_cache_dtype": [(d, {"f16": "full precision (Unsloth's default)",
+                            "q8_0": "half the KV memory of f16",
+                            "q4_0": "a quarter of the KV memory of f16",
+                            }.get(d, "")) for d in up.VALID_KV_DTYPES],
+    "spec_mode": [(mode, {"auto": "Unsloth probes the build and picks",
+                          "off": "no speculative decoding",
+                          }.get(mode, "")) for mode in up.SPEC_MODES],
+    "vision": [(True, "attach the mmproj (Unsloth's default)"),
+               (False, "text only; frees the projector's VRAM")],
+    "tensor_parallel": [(False, "split by layer (Unsloth's default)"),
+                        (True, "split by tensor across the GPUs")],
+}
+
+
+def _quiet(fn, *args):
+    """(result, output) for a CLI-side function called from inside curses.
+
+    Its prints -- and a _die, which prints and exits -- would otherwise land
+    on top of the screen. A _die comes back as (None, its message).
+    """
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            return fn(*args), buf.getvalue()
+    except SystemExit:
+        return None, buf.getvalue().strip()
+
+
+def _review_value(lb: Launch, fld: str) -> tuple:
+    """(value, where it came from), as the review screen shows a field."""
+    if fld in up.SAMPLING_FIELDS:
+        if fld in lb.sampling:
+            return lb.sampling[fld], lb.sources.get(fld, "")
+        # Nothing pinned: name the number the server applies instead, and say
+        # it is not a pin -- a client can still send its own.
+        d = up.unsloth_defaults(STUDIO_HOME, lb.model.repo_id)
+        if fld in d.applied:
+            return d.applied[fld], "unsloth's own, not pinned"
+        return up.SCHEMA_DEFAULTS.get(fld), "schema default, not pinned"
+    return getattr(lb, fld), lb.sources.get(fld, "Unsloth default")
+
+
+def _parse_review_input(fld: str, text: str) -> tuple:
+    """(value, error) for typed input. (None, "") means blank: keep it."""
+    t = text.strip().lower()
+    if not t:
+        return None, ""
+    if fld == "ctx":
+        if t in ("0", "fit", "max", "fit-max"):
+            return 0, ""
+        mult = 1024 if t.endswith("k") else 1
+        try:
+            n = int(float(t.rstrip("k")) * mult)
+        except ValueError:
+            return None, f"not a context length: {text.strip()!r}"
+        if not 1 <= n <= 1048576:
+            return None, "context must be 1..1048576, or 0 for fit-max"
+        return n, ""
+    bounds = {"spec_draft_n_max": (1, 16), "parallel": (1, 64)}
+    if fld in bounds or fld in up.INT_FIELDS:
+        lo, hi = bounds.get(fld) or up.SAMPLING_RANGES[fld]
+        try:
+            n = float(t)
+        except ValueError:
+            return None, f"{_FIELD_LABELS[fld]}: not a number"
+        if n != int(n) or not lo <= n <= hi:
+            return None, f"{_FIELD_LABELS[fld]} must be a whole number {lo}..{hi}"
+        return int(n), ""
+    lo, hi = up.SAMPLING_RANGES[fld]
+    try:
+        v = float(t)
+    except ValueError:
+        return None, f"{_FIELD_LABELS[fld]}: not a number"
+    if not lo <= v <= hi:
+        return None, (f"{_FIELD_LABELS[fld]} must be {lo}..{hi} — the range "
+                      f"`unsloth studio run` accepts")
+    return v, ""
+
+
+def _tui_review_edit(stdscr, fld: str, cur) -> tuple:
+    """Ask for one field's new value: (changed, value, error)."""
+    label = _FIELD_LABELS[fld]
+    if fld in _REVIEW_CHOICES:
+        opts = _REVIEW_CHOICES[fld]
+        now = _norm_value(fld, cur)
+        items = [(f"{'*' if _norm_value(fld, v) == now else ' '} "
+                  f"{_fmt_value(fld, v):<14}{note}", 0) for v, note in opts]
+        start = next((i for i, (v, _n) in enumerate(opts)
+                      if _norm_value(fld, v) == now), 0)
+        idx = tui.select(stdscr, f"{label}   (* = current)", items, start=start)
+        return (False, None, "") if idx < 0 else (True, opts[idx][0], "")
+    hint = {"ctx": "tokens, e.g. 262144 or 256k; 0 = fit-max",
+            "spec_draft_n_max": "1-16", "parallel": "1-64"}.get(fld)
+    if hint is None:
+        lo, hi = up.SAMPLING_RANGES[fld]
+        hint = f"{lo}..{hi}"
+    val, err = _parse_review_input(fld, tui.text(
+        stdscr, f"{label} [{_fmt_value(fld, cur)}]  ({hint}; blank keeps): "))
+    return (val is not None), val, err
+
+
+def _save_route_words(lb: Launch, load_profile: str, fld: str) -> tuple:
+    """(where edits to this kind of field save, why not -- or "")."""
+    target, why = _save_route(lb, load_profile, fld)
+    if target == "preset":
+        return (f'preset "{lb.preset.name}"'
+                + ("" if fld in up.SAMPLING_FIELDS or load_profile == "none"
+                   else f" + the {lb.variant or 'per-model'} override")), ""
+    if target == "override":
+        return f"the {lb.variant or 'per-model'} override", ""
+    return "this instance only — no profile to save into", why
+
+
+def _tui_review_settings(stdscr, m: ml.ModelInfo, ns: argparse.Namespace):
+    """Show what this launch will run with, let any of it be edited, and
+    offer to save the edits back to the profile each one came from.
+
+    Returns (edits, save, launch) -- edits as {Launch field: value}, save
+    whether to write them back once the model has loaded, launch the
+    resolved Launch with the edits applied -- or None on cancel.
+    """
+    import curses
+    base, err = _quiet(_resolve_launch, m, ns)
+    if base is None:
+        tui.pause(stdscr, f"{err or 'Could not resolve this launch.'}\n\n"
+                          f"Press Enter ...")
+        return None
+    dim = curses.color_pair(_C_DIM)
+    warn = curses.color_pair(_C_YELLOW)
+    good = curses.color_pair(_C_GREEN)
+    lp = (ns.load_profile or "auto").strip().lower()
+    edits: dict = {}
+    flash = ""
+    sel = 1                               # the first field, under its heading
+
+    while True:
+        trial = argparse.Namespace(**vars(ns))
+        for fld, val in edits.items():
+            setattr(trial, _EDIT_ARGS[fld], val)
+        lb, err = _quiet(_resolve_launch, m, trial)
+        if lb is None:
+            if not edits:
+                # Not an edit's fault: studio.db changed under the screen (a
+                # preset deleted, say). Nothing sensible to show.
+                tui.pause(stdscr, f"{err or 'Could not resolve this launch.'}"
+                                  f"\n\nPress Enter ...")
+                return None
+            # Input is validated before it lands here, so this is a resolver
+            # objection nobody predicted. Undo rather than trap the user.
+            flash = (err or "that edit could not be applied").splitlines()[-1]
+            edits.popitem()
+            continue
+        save = _profile_save_plan(lb, trial)
+
+        rows: list = []                   # (kind, field) per item
+        items: list = []
+
+        def heading(title):
+            rows.append(("sep", ""))
+            items.append((title, curses.A_BOLD))
+
+        def field_row(fld):
+            val, src = _review_value(lb, fld)
+            text = (f"{'*' if fld in edits else ' '} {_FIELD_LABELS[fld]:<16}"
+                    f"{_fmt_value(fld, val):<18}")
+            if fld in edits:
+                was = _fmt_value(fld, _review_value(base, fld)[0])
+                text += f"edited, was {was}"
+                if fld in save.instance_only:
+                    text += "  — instance only"
+                items.append((text, warn))
+            else:
+                items.append((text + src, dim if "not pinned" in src else 0))
+            rows.append(("field", fld))
+
+        heading("Sampling")
+        for fld in up.SAMPLING_FIELDS:
+            field_row(fld)
+        heading("Load")
+        for fld in _REVIEW_LOAD:
+            field_row(fld)
+        rows.append(("sep", ""))
+        items.append(("", 0))
+        if edits:
+            rows.append(("go", ""))
+            items.append(("  Continue — the edits apply to this launch only",
+                          0 if save.needs else good))
+            if save.needs:
+                rows.append(("save", ""))
+                label = (f"  Continue, and save to {save.targets(lb.variant)} "
+                         f"once it has loaded")
+                n = len(save.instance_only)
+                if n:
+                    label += (f"  ({n} edit{'s stay' if n != 1 else ' stays'} "
+                              f"instance-only)")
+                items.append((label, good))
+            rows.append(("undo", ""))
+            items.append(("  Undo all edits", 0))
+        else:
+            rows.append(("go", ""))
+            items.append(("  Continue — nothing changed", good))
+
+        if lb.sampling_source == "docs":
+            samp = (f"docs {lb.doc.label}/{lb.doc.mode}" if lb.doc
+                    else "docs (none published for this model)")
+        elif lb.sampling_source == "preset":
+            samp = f"preset {lb.preset.name}" if lb.preset else "preset (none)"
+        else:
+            samp = f"{lb.sampling_source} (nothing pinned)"
+        header = [
+            (f"{m.repo_id}   [{lb.variant or 'default quant'}]", curses.A_BOLD),
+            (f"load from {lb.load_source}   ·   sampling from {samp}", dim),
+            ("", 0),
+        ]
+        for i, (kind, probe) in enumerate((("load", "ctx"),
+                                           ("sampling", "temperature"))):
+            where, why = _save_route_words(lb, lp, probe)
+            header.append((f"{'Edits save to:' if i == 0 else '':<16}"
+                           f"{kind:<9}→ {where}", warn if why else dim))
+            if why:
+                header.append((f"{'':<27}({why})", dim))
+        header.append(("Sampling values are pins: they win over what a client "
+                       "sends.", dim))
+        if flash:
+            header.append((flash, curses.color_pair(_C_RED) | curses.A_BOLD))
+            flash = ""
+
+        idx = tui.select(stdscr, "Review settings  (Enter edits a value)",
+                         items, header=header, start=sel)
+        if idx < 0:
+            return None
+        sel = idx
+        kind, fld = rows[idx]
+        if kind == "go":
+            return edits, False, lb
+        if kind == "save":
+            return edits, True, lb
+        if kind == "undo":
+            edits.clear()
+            continue
+        if kind != "field":
+            continue
+        changed, val, err = _tui_review_edit(stdscr, fld, _review_value(lb, fld)[0])
+        if err:
+            flash = err
+        elif changed:
+            # Back to what the launch already had is no edit at all -- except
+            # for sampling that was not pinned, where typing the number the
+            # server applies anyway still turns it into a pin.
+            supplied = fld not in up.SAMPLING_FIELDS or fld in base.sampling
+            if supplied and _norm_value(fld, val) == \
+                    _norm_value(fld, _review_value(base, fld)[0]):
+                edits.pop(fld, None)
+            else:
+                edits[fld] = val
+
+
 def _tui_act_start(stdscr):
     name = _tui_pick_model(stdscr, title="Start which model?")
     if not name:
@@ -3631,8 +4423,22 @@ def _tui_act_start(stdscr):
     if picked is None:
         return
     load, sampling, mode, preset = picked
-    # After the profile: the slot count the warning quotes comes from it.
-    tools = _tui_pick_tools(stdscr, name, variant, load, preset)
+    m = ml.find_model(HF_HOME, name)
+    if m is None:
+        return
+    ns = _launch_namespace(dict(model=name, variant=variant, preset=preset,
+                                load_profile=load, sampling=sampling,
+                                mode=mode))
+    # What the profile resolved to, before anything else is asked: this is
+    # where it can be seen, changed, and saved back to that profile.
+    reviewed = _tui_review_settings(stdscr, m, ns)
+    if reviewed is None:
+        return
+    edits, save, lb = reviewed
+    # After the review: the slot count the warning quotes is the one this
+    # launch will really ask for, edits included.
+    tools = _tui_pick_tools(stdscr,
+                            lb.parallel if lb.parallel is not None else 4)
     if tools is None:
         return
     keep_warm = _tui_pick_keep_warm(stdscr)
@@ -3641,11 +4447,11 @@ def _tui_act_start(stdscr):
     port_s = tui.text(stdscr, f"Port (blank = auto, {PORT_POOL_LABEL}): ")
     port = int(port_s) if port_s.isdigit() else None
     gpus = tui.text(stdscr, "GPUs, e.g. 0 or 0,1 (blank = profile / auto): ")
-    tui.run_cmd(stdscr, cmd_start, argparse.Namespace(
-        model=name, preset=preset, port=port, gpus=gpus, variant=variant,
-        load_profile=load, sampling=sampling, mode=mode, tools=tools,
-        keep_warm=keep_warm,
-        api_key="", dry_run=False, wait=None, force=False))
+    ns.port, ns.gpus, ns.tools, ns.keep_warm = port, gpus, tools, keep_warm
+    for fld, val in edits.items():
+        setattr(ns, _EDIT_ARGS[fld], val)
+    ns.save_profile = save
+    tui.run_cmd(stdscr, cmd_start, ns)
 
 
 def _tui_act_settings(stdscr):
@@ -3887,27 +4693,26 @@ def _slot_usage(entry: dict) -> dict | None:
                      "loaded": False}
         _SLOT_CACHE[pid] = (now, usage)
         return usage
-    if port:
-        try:
-            with _http(f"http://127.0.0.1:{port}/slots", timeout=0.6) as r:
-                slots = json.loads(r.read().decode())
-            if isinstance(slots, list) and slots:
-                usage = {
-                    "busy": sum(1 for s in slots if s.get("is_processing")),
-                    "total": len(slots),
-                    "n_ctx": slots[0].get("n_ctx") or 0,
-                    "tps": 0.0,
-                    "loaded": True,
-                }
-                # Always read the counters, so the held rate stays current for
-                # when the server goes quiet; show live progress while it isn't.
-                held = _llama_tps(pid, port)
-                live = _live_decode_tps(pid, slots)
-                usage["tps"] = held if live is None else live
-        except (urllib.error.URLError, OSError, ValueError):
-            # A stale cached port survives an idle-reload; drop it so the next
-            # call rediscovers rather than retrying a dead one for 30s.
-            _LLAMA_PORT_CACHE.pop(pid, None)
+    try:
+        with _http(f"http://127.0.0.1:{port}/slots", timeout=0.6) as r:
+            slots = json.loads(r.read().decode())
+        if isinstance(slots, list) and slots:
+            usage = {
+                "busy": sum(1 for s in slots if s.get("is_processing")),
+                "total": len(slots),
+                "n_ctx": slots[0].get("n_ctx") or 0,
+                "tps": 0.0,
+                "loaded": True,
+            }
+            # Always read the counters, so the held rate stays current for
+            # when the server goes quiet; show live progress while it isn't.
+            held = _llama_tps(pid, port)
+            live = _live_decode_tps(pid, slots)
+            usage["tps"] = held if live is None else live
+    except (urllib.error.URLError, OSError, ValueError):
+        # A stale cached port survives an idle-reload; drop it so the next
+        # call rediscovers rather than retrying a dead one for 30s.
+        _LLAMA_PORT_CACHE.pop(pid, None)
     _SLOT_CACHE[pid] = (now, usage)
     return usage
 
@@ -3939,9 +4744,12 @@ def _load_tokens() -> dict:
         with open(TOKENS_FILE) as f:
             doc = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return {"models": {}}
-    if not isinstance(doc.get("models"), dict):
-        doc["models"] = {}
+        return {"models": {}, "hours": {}, "days": {}}
+    # A file written before the history existed has models and nothing else,
+    # and an unreadable one starts over: neither is a reason to fail a read.
+    for key in ("models", "hours", "days"):
+        if not isinstance(doc.get(key), dict):
+            doc[key] = {}
     return doc
 
 
@@ -3956,7 +4764,7 @@ def _save_tokens(doc: dict) -> None:
         pass          # a figure to report, never a reason to fail a command
 
 
-def _tokens_sample(name: str, entry: dict, sample: bool = True) -> dict:
+def _tokens_sample(name: str, entry: dict) -> dict:
     """Bank what this server has processed since the last look, and report it.
 
     Returns the model's record: `run_in`/`run_out` for the server running now,
@@ -3967,9 +4775,6 @@ def _tokens_sample(name: str, entry: dict, sample: bool = True) -> dict:
     means the whole counter, because that process began at zero. Without the
     pid an idle reload would either double-count the new server's tokens or
     silently drop them.
-
-    `sample` False reports what is already banked without probing, for a caller
-    that only wants to print history.
     """
     doc = _load_tokens()
     rec = dict(_TOKENS_BLANK)
@@ -3983,7 +4788,7 @@ def _tokens_sample(name: str, entry: dict, sample: bool = True) -> dict:
         rec.update(run_in=0, run_out=0, run_pid=pid)
         dirty = True
 
-    child, port = _llama_server_proc(pid) if (sample and pid) else (0, 0)
+    child, port = _llama_server_proc(pid) if pid else (0, 0)
     # That lookup is cached for 30s, and a dead child means an idle reload has
     # happened since: reading the new llama-server's counters under the old
     # one's pid would look like the same process going backwards, and would
@@ -4006,6 +4811,9 @@ def _tokens_sample(name: str, entry: dict, sample: bool = True) -> dict:
             rec["run_in"] += d_in
             rec["run_out"] += d_out
             rec.update(raw_in=cur_in, raw_out=cur_out, raw_pid=child)
+            # The same difference, stamped with when it was seen: the all-time
+            # counters above cannot answer "how much today".
+            _tokens_record(doc, d_in, d_out)
             dirty = True
 
     if dirty:
@@ -4023,6 +4831,118 @@ def _tokens_totals(doc: dict | None = None) -> tuple[int, int]:
     doc = _load_tokens() if doc is None else doc
     return (sum(int(r.get("in") or 0) for r in doc["models"].values()),
             sum(int(r.get("out") or 0) for r in doc["models"].values()))
+
+
+# Windowed totals need history, and the all-time counters cannot carry it:
+# what a poll banks is a difference, and a difference only means anything once
+# it is stamped with when it was banked. Recent hours are kept hour by hour --
+# a 24h figure summed out of day buckets would be off by most of a day -- and
+# anything older is folded into its day, which keeps the file a few hundred
+# entries rather than the 8760 a year of hours would cost.
+_TOK_HOUR = 3600
+_TOK_DAY = 86400
+_TOK_HOUR_KEEP = 30 * _TOK_DAY      # hour buckets live this long, then roll up
+_TOK_DAY_KEEP = 366 * _TOK_DAY      # day buckets this long, then go
+
+# Label and reach of each window on the home screen's token line. Hour buckets
+# cover the first three, so only the year is ever rounded by more than an hour.
+TOKEN_WINDOWS = (("24h", _TOK_DAY), ("7d", 7 * _TOK_DAY),
+                 ("30d", 30 * _TOK_DAY), ("365d", 365 * _TOK_DAY))
+
+
+def _tok_bucket(val) -> tuple[int, int]:
+    """One stored [in, out] pair, tolerant of a file written by hand."""
+    try:
+        return int(val[0] or 0), int(val[1] or 0)
+    except (TypeError, ValueError, IndexError, KeyError):
+        return 0, 0
+
+
+def _tokens_record(doc: dict, d_in: int, d_out: int,
+                   now: float | None = None) -> None:
+    """Stamp a banked difference onto the hour it was banked in.
+
+    The difference accumulated between two polls rather than at this instant,
+    so a long gap lands all of it in the hour of the poll that noticed. Polls
+    run every few seconds while the home screen is open and on demand
+    otherwise, which is the resolution these windows are read at anyway.
+    """
+    d_in, d_out = int(d_in or 0), int(d_out or 0)
+    if not d_in and not d_out:
+        return
+    now = time.time() if now is None else now
+    key = str(int(now // _TOK_HOUR))
+    tin, tout = _tok_bucket(doc["hours"].get(key))
+    doc["hours"][key] = [tin + d_in, tout + d_out]
+    _tokens_rollup(doc, now)
+
+
+def _tokens_rollup(doc: dict, now: float) -> None:
+    """Fold hours past the hour window into their day, drop days past a year.
+
+    Only ever called on the way to a save, so the file that lands is already
+    pruned and an untouched one never grows.
+    """
+    hours, days = doc["hours"], doc["days"]
+    for key in list(hours):
+        try:
+            start = int(key) * _TOK_HOUR
+        except (TypeError, ValueError):
+            del hours[key]
+            continue
+        if now - start < _TOK_HOUR_KEEP:
+            continue
+        tin, tout = _tok_bucket(hours.pop(key))
+        dkey = str(start // _TOK_DAY)
+        was_in, was_out = _tok_bucket(days.get(dkey))
+        days[dkey] = [was_in + tin, was_out + tout]
+    for key in list(days):
+        try:
+            start = int(key) * _TOK_DAY
+        except (TypeError, ValueError):
+            del days[key]
+            continue
+        if now - start >= _TOK_DAY_KEEP:
+            del days[key]
+
+
+def _tokens_window(doc: dict, seconds: float,
+                   now: float | None = None) -> tuple[int, int]:
+    """in/out banked within the last `seconds`.
+
+    A bucket that straddles the cutoff counts whole: this is a trend, and the
+    sampling behind it is not precise to the minute anyway. A day bucket only
+    ever holds what was already past the hour window, so the two tables never
+    cover the same traffic twice.
+    """
+    now = time.time() if now is None else now
+    cutoff = now - seconds
+    tin = tout = 0
+    for unit, table in ((_TOK_HOUR, doc["hours"]), (_TOK_DAY, doc["days"])):
+        for key, val in table.items():
+            try:
+                start = int(key) * unit
+            except (TypeError, ValueError):
+                continue
+            if start + unit <= cutoff:
+                continue
+            a, b = _tok_bucket(val)
+            tin += a
+            tout += b
+    return tin, tout
+
+
+def _tokens_windows(doc: dict | None = None,
+                    now: float | None = None) -> list[tuple[str, int, int]]:
+    """Every window of TOKEN_WINDOWS as (label, in, out), in order.
+
+    Host-wide like the all-time figure, and for the same reason: what the box
+    served over a day does not depend on what happens to be loaded now.
+    """
+    doc = _load_tokens() if doc is None else doc
+    now = time.time() if now is None else now
+    return [(label, *_tokens_window(doc, secs, now))
+            for label, secs in TOKEN_WINDOWS]
 
 
 def _fmt_tokens(n: int) -> str:
@@ -4043,6 +4963,27 @@ def _fmt_token_pair(tin: int, tout: int) -> str:
     """Input then output, arrows rather than words: the pair has to be narrow
     enough to sit on a server's line next to everything else."""
     return f"↑{_fmt_tokens(tin)} ↓{_fmt_tokens(tout)}"
+
+
+def _tokens_window_line(cols: int, doc: dict | None = None) -> list:
+    """The home screen's token history, as one segmented line.
+
+    Windows are dropped from the wide end when the terminal cannot hold them:
+    the line is drawn with truncation at the screen edge, and a figure sliced
+    in half reads as a smaller number rather than as a missing one.
+    """
+    import curses
+    line = [("  Tokens  ", curses.color_pair(_C_DIM))]
+    used = 2 + sum(len(t) for t, _ in line)   # 2 = the header's left margin
+    for label, tin, tout in _tokens_windows(doc):
+        pair = _fmt_token_pair(tin, tout)
+        width = len(label) + 1 + len(pair) + 3
+        if used + width > cols:
+            break
+        line.append((f"{label} ", curses.A_BOLD))
+        line.append((f"{pair}   ", curses.color_pair(_C_CYAN)))
+        used += width
+    return line
 
 
 # Per log file: how far it has been read, and what the lines so far added up to.
@@ -4268,8 +5209,12 @@ def _settings_segments(name: str, entry: dict, terse: bool = False,
     else:
         add("tools", "tools ON", hot)
 
+    # Always shown, and coloured like tools: on is the one to notice, since
+    # the projector holds VRAM a text-only server never uses.
     if eff.get("vision") is False:
-        add("vis", "no-vis", hot)
+        add("vis", "vis_off", ok)
+    else:
+        add("vis", "vis_on", hot)
 
     # Live, like the session count: a pinger that died should stop claiming
     # the server is being held warm.
@@ -4309,8 +5254,6 @@ def _settings_segments(name: str, entry: dict, terse: bool = False,
     # Logical order reads best; importance order only earns its keep when the
     # line is going to be cut, so choose by whether it actually fits.
     logical = ("ctx", "kv", "sl", "spec", "tools", "vis", "warm", "samp")
-    # Sessions rank second: it is the only live fact on the line, and a busy
-    # server is what you most want to know before touching it.
     by_impact = ("tools", "sl", "warm", "samp", "kv", "ctx", "spec", "vis")
     def _group(slot):
         val = parts.get(slot)
@@ -4574,8 +5517,9 @@ def _tui_main(stdscr):
             # screen, so a full complement of servers must not push it off.
             rows, cols = stdscr.getmaxyx()
             gpu_rows = (len(_gpus()) + 1) if _gpus() else 1
-            # title, blanks, section headers, gpu bars, legend, ram, separator
-            chrome = 11 + gpu_rows
+            # title, blanks, section headers, token window line, gpu bars,
+            # legend, ram, separator
+            chrome = 12 + gpu_rows
             avail = max(1, rows - chrome - _MENU_MIN_ROWS)
             two_line = len(running) * 2 <= avail
             # Narrow terminals drop the values that are already at a default
@@ -4673,6 +5617,11 @@ def _tui_main(stdscr):
                 f"Running: none   {churned}"
                 f"     ⏱ {ts} · refresh {every}",
                 curses.A_DIM))
+
+        # How much of that all-time figure is recent. Host-wide and drawn
+        # whether or not anything is running, so the line never moves: the
+        # counters are banked per model but the question is about the box.
+        header.append(_tokens_window_line(stdscr.getmaxyx()[1]))
 
         header.append(("", 0))
         gsplit = _gpu_usage_split()
@@ -4860,6 +5809,11 @@ Override with --api-key or UNSLOTH_MGR_API_KEY.
                     help="key for the post-load readout (default: from the log)")
     sp.add_argument("--wait", type=int,
                     help="seconds to wait for readiness (0 = don't wait)")
+    sp.add_argument("--save-profile", dest="save_profile", action="store_true",
+                    help="once the model has loaded, write the values given "
+                         "as flags back into the profile they override (the "
+                         "Studio preset and/or this quant's per-model "
+                         "override), through Studio's own settings API")
     sp.add_argument("--dry-run", dest="dry_run", action="store_true",
                     help="print the plan and the command line, start nothing")
     sp.add_argument("--force", action="store_true",

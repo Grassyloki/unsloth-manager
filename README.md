@@ -10,7 +10,8 @@ It is the Unsloth counterpart to the sibling
 **(model, profile, port)**, and every profile is *Unsloth's own* — read live out
 of `studio.db`, out of the Studio venv's shipped tables, or transcribed from
 Unsloth's published model guides. This tool invents no settings of its own; what
-it does is show you which source won, before the load and after it.
+it does is show you which source won, before the load and after it — and, when
+you change a value at launch, save it back into the Studio profile it came from.
 
 Built for and tested on a **2x NVIDIA Tesla V100-SXM2 32 GB** box running
 CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
@@ -18,9 +19,12 @@ CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
 ## How this differs from vllm-manager
 
 - **Settings belong to Unsloth, not to this tool.** There is no `profiles.toml`.
-  You edit them on the Studio settings page and in the Preset dropdown; the
-  manager reads them and never writes to `studio.db`. The one thing it does own
-  is a transcription of Unsloth's *published* sampling guides — see
+  You edit them on the Studio settings page and in the Preset dropdown — or on
+  the manager's own review screen at launch, which saves an edit back into the
+  same Studio preset or per-model override, through **Studio's own settings
+  API**. The manager never opens `studio.db` for writing; see
+  [Editing a profile at launch](#editing-a-profile-at-launch). The one thing it
+  does own is a transcription of Unsloth's *published* sampling guides — see
   [Where settings come from](#where-settings-come-from) for why that is
   necessary.
 - **Servers run as a dedicated non-root user.** The manager runs as root and
@@ -38,6 +42,7 @@ CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
 - [Usage](#usage)
 - [Command reference](#command-reference)
 - [Where settings come from](#where-settings-come-from)
+- [Editing a profile at launch](#editing-a-profile-at-launch)
 - [Context, and what "max" means](#context-and-what-max-means)
 - [Idle auto-unload, and what a reload restores](#idle-auto-unload-and-what-a-reload-restores)
 - [Keeping a server warm](#keeping-a-server-warm)
@@ -52,6 +57,7 @@ CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
 - [Connecting clients](#connecting-clients)
 - [Configuration](#configuration)
 - [Notes for this box](#notes-for-this-box)
+- [Tests](#tests)
 - [License](#license)
 
 **Files**
@@ -59,11 +65,12 @@ CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
 | File | Purpose |
 |------|---------|
 | `unsloth_manager.py` | Main entry point: TUI + CLI to start, stop, inspect, test and benchmark servers. |
-| `unsloth_profiles.py` | Every source of "how should this model run": published guides, Unsloth's shipped defaults, Studio presets, per-model overrides. |
+| `unsloth_profiles.py` | Every source of "how should this model run": published guides, Unsloth's shipped defaults, Studio presets, per-model overrides — plus the payload shapes for saving an edit back to the last two. |
 | `model_lib.py` | HF-cache scanning, GGUF variant detection, VRAM fit estimation, native context length. |
 | `tui_lib.py` | Shared curses widgets (selector, prompts, coloured bars, screen plumbing). |
 | `api_tester.sh` | Interactive whiptail client for poking any OpenAI-compatible endpoint. |
-| `.env.example` | Template for `local.env`, the git-ignored per-machine settings file. |
+| `local.env.example` | Template for `local.env`, the git-ignored per-machine settings file. |
+| `tests/test_logic.py` | Unit tests for the logic that guards user data. See [Tests](#tests). |
 
 The manager runs on the system Python (3.10+) and imports nothing outside the
 standard library. `unsloth_profiles.py` will use PyYAML if it happens to be
@@ -102,9 +109,10 @@ answers "what am I not running stock?" at a glance:
 ```
 Running: 2 model(s), 2 ready   all-time ↑18.9M ↓4.1M     ⏱ 21:40:03 · refresh 5s
   ● Qwen3.6-35B-A3B-MTP-GGUF UD-Q4_K_XL :10001 rdy g0   0/2sl            ↑820K ↓191K    load 9.3s
-      256k  kv q4_0  mtp  tools ON  no-vis  | T1.0 P0.95 K20 M0.0 pres0.0 rep1.0
+      256k  kv q4_0  mtp  tools ON  vis_off  | T1.0 P0.95 K20 M0.0 pres0.0 rep1.0
   ● Qwen3.8-27B-GGUF         UD-Q4_K_XL :10002 rdy g1   1/3sl  16 tok/s  ↑614K ↓121K    load 13s
-      256k  kv q4_0  mtp  tools off  no-vis  warm | T1.0 P0.95 K20 M0.0 pres0.0 rep1.0
+      256k  kv q4_0  mtp  tools off  vis_off  warm | T1.0 P0.95 K20 M0.0 pres0.0 rep1.0
+  Tokens  24h ↑412K ↓96.2K   7d ↑3.1M ↓702K   30d ↑11.4M ↓2.6M   365d ↑18.9M ↓4.1M
 ```
 
 The first line is what a server *is* — identity, placement, and the facts that
@@ -116,7 +124,10 @@ does not move. `status` spells them out (`sessions 1/3  8.0 tok/s  last load
 9.3s (idle reload)`), and the `settings` readout carries sessions and rate.
 
 The figure in the header is the other half of that pair: every model's tokens,
-all-time, for the box rather than for one server — see
+all-time, for the box rather than for one server. The `Tokens` line under the
+servers is the third: the same host-wide figure cut into the last 24 hours, 7
+days, 30 days and year, so a large all-time number can be told apart from a
+box that is still busy. All three are covered in
 [Tokens churned](#tokens-churned).
 
 The load time is what an idle unload costs: once Studio has freed the weights,
@@ -186,7 +197,10 @@ Values it cannot establish are omitted rather than defaulted: a server started
 by an older version records less, and printing `kv f16` for one actually
 running `q4_0` would be worse than printing nothing.
 
-Start walks model → **quant** → profile → **server-side tools** → **idle behaviour** → port → GPUs. The quant step matters
+Start walks model → **quant** → profile → **review** → **server-side tools** → **idle behaviour** → port → GPUs. The review step
+shows every sampling value and the load settings that matter, each with its
+source, and lets you edit them and save the edits back to that profile — see
+[Editing a profile at launch](#editing-a-profile-at-launch). The quant step matters
 more than it looks: per-model overrides are keyed `<repo>:<variant>`, so the
 quant decides which saved profile the launch reads. The picker marks the ones
 Unsloth has settings for:
@@ -233,11 +247,12 @@ python unsloth_manager.py settings <model>                # every settings sourc
 python unsloth_manager.py presets                         # what the Studio UI has saved
 python unsloth_manager.py list [--variants]               # cached models, GGUF quants, VRAM fit
 python unsloth_manager.py start <model> [--port N] [--gpus 0,1] [--dry-run]
+python unsloth_manager.py start <model> --kv-cache-dtype q8_0 --save-profile  # ...and write it back to the profile
 python unsloth_manager.py status                          # running servers, ports, GPU usage
 python unsloth_manager.py logs <model> [-n N] [-f]        # tail a server log
 python unsloth_manager.py test <model> --api-key KEY      # one streaming prompt + tok/s
 python unsloth_manager.py benchmark [<model>] [--preset NAME ...]  # running: as-is; else a preset sweep
-python unsloth_manager.py restart <model>                 # keeps port, GPUs and profile choices
+python unsloth_manager.py restart <model>                 # keeps port, GPUs, profile choices and flags
 python unsloth_manager.py stop <model>
 python unsloth_manager.py stop-all
 python unsloth_manager.py doctor
@@ -267,7 +282,7 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 |---|---|
 | `start <model>` | Start a server. The bulk of the options; see below. |
 | `stop <model>` / `stop-all` | SIGTERM, escalating to a process-group SIGKILL after `STOP_TIMEOUT`. |
-| `restart <model>` | Stop then start, keeping port, GPUs, quant and profile choices. |
+| `restart <model>` | Stop then start, keeping port, GPUs, quant, profile choices and every explicit flag it was started with. |
 | `status` | Running servers, their settings, ports, uptime, token totals and GPU usage. |
 | `list [--variants]` | Cached models and their all-time token totals; `--variants` adds each GGUF quant, its size and VRAM fit. |
 | `settings <model>` | All four settings sources side by side, plus live state if it is running. |
@@ -325,7 +340,8 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | `--tools` / `--no-tools` | Unsloth's server-side web/code tools. Default on — and it serialises `/v1`. |
 | `--keep-warm` / `--no-keep-warm` | Hold this server against Studio's idle unload. Default off. |
 | `--wait N` | Seconds to wait for readiness; `0` returns immediately. Default `LOAD_TIMEOUT`. |
-| `--dry-run` | Print the plan and the command line, start nothing. Touches no state. |
+| `--save-profile` | Once the model has loaded, write the values given as flags back into the profile they override — the Studio preset and/or this quant's per-model override. See [Editing a profile at launch](#editing-a-profile-at-launch). |
+| `--dry-run` | Print the plan and the command line, start nothing. Touches no state and saves nothing. |
 | `--force` | Start despite a VRAM warning or an instance already running. |
 | `--api-key K` | Key for the post-load readout. Default: read from the server's own log. |
 
@@ -353,7 +369,7 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 
 | Entry | |
 |---|---|
-| **Start Model** | model → quant → profile → tools → idle behaviour → port → GPUs, then the launch plan. |
+| **Start Model** | model → quant → profile → review (edit, and optionally save back) → tools → idle behaviour → port → GPUs, then the launch plan. |
 | **Instance Groups** | Restore / save / show / clear the ten slots. |
 | **Model Settings** | `settings` for one model. |
 | **Stop Model** | Stop one running server. |
@@ -468,6 +484,12 @@ A preset supplies the load config only when no per-model override exists (or
 with `--load-profile preset`), and its sampling is **never** pinned unless you
 ask for it with `--sampling preset`. `presets` lists them and says so.
 
+A preset's `disableVision` is honoured the same way an override's
+`disable_vision` is — as `--no-mmproj`. Until it was, a preset that said
+"vision off" launched with the projector attached, and the first idle reload,
+reading the override where the same choice usually also lives, quietly took it
+away again.
+
 ### Choosing, and being told
 
 ```bash
@@ -487,7 +509,10 @@ Every value stays overridable per launch — `--ctx`, `--parallel`,
 `--vision/--no-vision`, `--n-batch`, `--n-ubatch`, and each of `--temperature`,
 `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`, `--repetition-penalty`.
 Precedence is always **explicit flag > profile > Unsloth's default**, and the
-launch plan prints the winning source in brackets next to every value.
+launch plan prints the winning source in brackets next to every value. Add
+`--save-profile` and the explicit values are written back into the profile they
+beat, once the model has loaded — see
+[Editing a profile at launch](#editing-a-profile-at-launch).
 
 `--extra` passes raw arguments to llama-server (repeatable, GGUF only):
 `--extra=-ngl --extra=99`.
@@ -522,6 +547,137 @@ earlier version of this manager translated the tokens itself and probed
 `--spec-draft-n-max` is emitted only for the modes that actually launch a
 drafter with a configurable depth. Ask for it with anything else and the launch
 says it is being ignored rather than passing a flag nothing reads.
+
+## Editing a profile at launch
+
+Between choosing where settings come from and launching, the TUI shows what
+the launch will actually run with — every sampling value and the load settings
+that decide cost and behaviour — each next to the source it came from, and lets
+you change any of them in place:
+
+```
+Review settings  (Enter edits a value)
+
+ukisai/Swift-Qwen3.8-27B-GGUF   [Q4_K_L]
+load from preset Qwen3.8-27B-Thinking   ·   sampling from preset Qwen3.8-27B-Thinking
+
+Edits save to:  load     → preset "Qwen3.8-27B-Thinking" + the Q4_K_L override
+                sampling → preset "Qwen3.8-27B-Thinking"
+Sampling values are pins: they win over what a client sends.
+────────────────────────────────────────────────────────
+  Sampling
+  * temperature     0.8               edited, was 1.0
+    top_p           0.95              preset Qwen3.8-27B-Thinking
+    ...
+  Load
+    context         262,144 (256k)    preset
+  * kv cache        q4_0              edited, was q8_0
+    speculative     mtp               preset
+    ...
+    Continue — the edits apply to this launch only
+    Continue, and save to preset "Qwen3.8-27B-Thinking" + the Q4_K_L override once it has loaded
+    Undo all edits
+```
+
+Numbers are typed (`256k` and `0` for fit-max work for the context); the KV
+dtype, speculative mode, vision and tensor split are picked from a list. A value
+out of the range `unsloth studio run` accepts is refused on the spot rather than
+at launch, and setting a field back to what the profile already gave it is not
+an edit.
+
+An edit becomes the matching `start` flag, so **Continue** is exactly a launch
+with those flags — and, like any flag, it is kept in the instance's saved
+answers, which `restart` and instance groups replay. **Continue, and save**
+also writes the edits back into the profile each one came from, so the *next*
+start of this model reads them from there, and so does Studio's own idle
+reload. On the CLI it is the same thing spelled `--save-profile`:
+
+```bash
+python unsloth_manager.py start Swift-Qwen3.8-27B-GGUF --variant Q4_K_L \
+    --preset Qwen3.8-27B-Thinking --load-profile preset --sampling preset \
+    --temperature 0.8 --kv-cache-dtype q4_0 --save-profile
+```
+
+The launch plan shows the save before anything happens:
+
+```
+profile save: after the model loads, through Studio's own settings API
+  preset "Qwen3.8-27B-Thinking"
+    kv cache        q8_0              ->  q4_0
+    temperature     1.0               ->  0.8
+  override ukisai/Swift-Qwen3.8-27B-GGUF:Q4_K_L   — what an idle reload rebuilds from
+    kv cache        q8_0              ->  q4_0
+```
+
+### Where each edit goes
+
+| the value came from | a save writes it to |
+|---|---|
+| a Studio preset — load settings | that preset **and** this quant's per-model override |
+| the per-model override, or nothing, under `--load-profile auto`/`override` | this quant's per-model override (created if there is none) |
+| a Studio preset — sampling | that preset |
+| the published docs table, or Unsloth's own defaults — sampling | **nowhere**: kept on this instance only, and the launch says so |
+| anything under `--load-profile none` | **nowhere**: kept on this instance only |
+
+The override is written alongside the preset because an idle reload reads
+**only** the override (see [Idle auto-unload](#idle-auto-unload-and-what-a-reload-restores)):
+an edit saved to the preset alone would be undone the first time the server
+sat idle for five minutes. So whenever a save goes to Studio, the override is
+made to reproduce this launch's load config in full — which also ends the job
+of keeping a preset and its quant's override in step by hand. Overrides hold no
+sampling, and do not need to: sampling pins ride the server's environment,
+which no reload touches.
+
+Sampling from the published docs table has no profile to go back to — that
+table is a transcription of Unsloth's guides, not a setting. An edit to it stays
+an explicit flag on this instance: `restart` and a saved group keep it, and no
+other launch of the model sees it. The review screen and the launch plan both
+mark it **instance only** rather than letting it look saved. To make it a saved
+setting, launch that model from a Studio preset.
+
+One consequence of `--load-profile auto` worth knowing: it reads the per-model
+override *before* the preset, so a save for a quant that had no override creates
+one, and from then on `auto` loads that quant from the (identical) override. The
+plan notes it when it happens.
+
+### How the save is made
+
+- **Through Studio's API, not the database.** A preset goes through
+  `POST /api/chat/settings/compare-and-set` and an override through
+  `PUT /api/settings/openai-auto-switch/overrides` — the routes Studio's own
+  settings page uses — so Studio's validation, locking and cache invalidation
+  all apply. Nothing in this manager opens `studio.db` for writing.
+- **After the model loads, through the new server.** Those routes need a live
+  server and its key, and the key is printed only once the load completes. The
+  useful consequence: a profile is never rewritten with settings that failed to
+  load. If the load dies or times out, or `--wait 0` means it is never
+  confirmed, nothing is saved and the launch says so; the edits stay on the
+  instance. `--dry-run` shows the save and does not make it.
+- **Refused, not merged, on a conflict.** The preset entry and the override row
+  must still be exactly what the launch read. If either was changed in Studio in
+  the meantime, that part is not written, and the message says why.
+- **The whole row goes back.** Studio's override save *replaces* the row —
+  anything left out is cleared, a GPU pin included — so the payload is the
+  stored row with only the changed fields swapped in (extra llama args and the
+  server-tuning fields Studio carries over on its own). A preset keeps every
+  field this manager does not model: max tokens, system prompt, reasoning
+  budget and the rest.
+- **Read back.** Studio's normaliser drops a value it cannot use rather than
+  refusing the save, so a 200 proves little. The saved entry is read back, and
+  anything that did not stick is named.
+
+```
+Profile save
+
+  preset "Qwen3.8-27B-Thinking": saved kv cache, temperature
+  override ukisai/Swift-Qwen3.8-27B-GGUF:Q4_K_L: saved kv cache
+```
+
+A successful save removes those values from the instance's saved answers, so
+`restart` and a group saved afterwards read them from the profile — where a
+later edit in Studio still reaches them — instead of freezing this launch's
+copy. A group saved *before* the edit already names the preset, so its next
+restore picks the new values up too.
 
 ## Context, and what "max" means
 
@@ -588,6 +744,17 @@ line rather than nothing at all. `--parallel` is deliberately exempt: it is a
 server-wide startup default, so a reload that omits `n_parallel` still lands on
 the value the manager passed.
 
+Vision is compared by what each side *yields*. A launch that says nothing about
+it still attaches the projector — Unsloth does that on its own when the
+snapshot ships an mmproj — so an override with `disable_vision` is drift even
+against a launch that never mentioned vision. Missing exactly that case is how a
+preset launch ran for hours with the mmproj attached and then lost it to an
+idle reload unannounced. With no projector on disk there is nothing to compare.
+
+The fix the warning suggests — make the override match — is one keystroke on
+the review screen: **Continue, and save** writes the launch's load config into
+the override. See [Editing a profile at launch](#editing-a-profile-at-launch).
+
 The readout also compares what the server reports against what the manager
 launched with, and says so when they disagree — a server can be reloaded out
 from under this tool by the Studio UI, a `/v1` auto-switch, or any
@@ -620,7 +787,8 @@ Studio's idle unload is **global**. `openai_api_auto_unload_idle_seconds`,
 `model_memory_keep_resident` and the auto-switch toggle all live in
 `app_settings`, apply to every model in a `STUDIO_HOME`, and none has an
 environment override — so "don't unload *this* one" cannot be expressed through
-Unsloth's settings at all, and this manager does not write to `studio.db`.
+Unsloth's settings at all. (The manager writes back to Studio only to save a
+profile you edited at launch; a global unload policy is not that.)
 
 It is done from outside instead. `start --keep-warm` (and the TUI's **Idle
 behaviour** step) launches a small detached process that pings that one server
@@ -635,8 +803,9 @@ python unsloth_manager.py keepalive <model>        # run one in the foreground
 The interval is half the configured TTL, clamped to 30–600s, so two pings fit
 in every idle window. Only a **POST to an inference path** stamps activity in
 Studio's tracker (`LlamaKeepWarmMiddleware`), so the ping is a real one-token
-completion — with `enable_tools: false`, because otherwise the ping itself
-would serialise `/v1` behind the tool machinery.
+completion — with `enable_tools: false` and `tool_choice: "none"`, because
+otherwise the ping itself would serialise `/v1` behind the tool machinery (on a
+tools-on server only the second one works; see [Gotchas](#gotchas-worth-knowing)).
 
 The pinger is recorded in the state file and killed by `stop` / `stop-all`
 before the server it was holding: a survivor would keep POSTing at a dead port
@@ -666,16 +835,25 @@ key can be found, the readout is skipped and says so; the load is unaffected.
 
 ## Tokens churned
 
-The home screen carries two token figures, and they are deliberately different
-things. Each server's line shows what **that server** has processed since it
-started; the summary line at the top shows what **this box** has processed
-all-time — every model, models that are not running now included, so stopping a
-server never makes the number fall.
+The home screen carries three token figures, and they are deliberately
+different things. Each server's line shows what **that server** has processed
+since it started; the summary line at the top shows what **this box** has
+processed all-time — every model, models that are not running now included, so
+stopping a server never makes the number fall; and the `Tokens` line shows that
+same host-wide total cut into **windows**, so an all-time figure that took a
+year to build is not mistaken for a box that is busy today.
 
 ```
 Running: 2 model(s), 2 ready   all-time ↑18.9M ↓4.1M     ⏱ 21:40:03 · refresh 5s
   ● Qwen3.8-27B-GGUF  UD-Q4_K_XL :10002 rdy g1  1/3sl  16 tok/s  ↑614K ↓121K
+  Tokens  24h ↑412K ↓96.2K   7d ↑3.1M ↓702K   30d ↑11.4M ↓2.6M   365d ↑18.9M ↓4.1M
 ```
+
+The window line is always drawn, running or not — the question it answers is
+about the box, not about what happens to be loaded — and it is always one line.
+A terminal too narrow for all four windows drops them from the wide end rather
+than letting the edge slice a figure in half, because half of `↑18.9M` reads
+as a real, smaller number.
 
 `status` prints both per server, in full, and adds the host line:
 
@@ -719,6 +897,30 @@ provider-style bill, and it is the honest number for "what has this box
 chewed through". Both only move when a request **completes**, which is the same
 caveat the throughput figure carries: a stream in flight adds nothing until it
 ends.
+
+**How the windows are kept.** The all-time counters cannot be cut into windows
+after the fact: a banked difference means nothing without the moment it was
+banked at. So the same differences are also stamped into buckets in
+`tokens.json`, host-wide rather than per model, and a window is the buckets it
+reaches summed:
+
+- **Hour buckets for the last 30 days, day buckets out to a year.** A 24h
+  figure summed from day buckets would be off by most of a day; a year of hour
+  buckets would be 8760 entries. Hours older than 30 days are folded into their
+  day on the next save, days older than 366 are dropped, so the file stays at a
+  few hundred entries and does not grow without bound.
+- **A bucket that straddles the start of a window counts whole.** Only the
+  365-day figure is ever rounded by more than an hour, and there it is worth
+  less than a third of a percent. These are trend figures; the sampling behind
+  them is not precise to the minute either.
+- **A difference lands in the hour of the poll that noticed it**, not spread
+  over the time it actually accumulated. With the home screen open that is a
+  5-second resolution; a box polled once a day banks a day's work into one
+  hour. The window totals are right either way, the shape within them is not.
+- **History starts when a version that keeps it first polls.** An existing
+  `tokens.json` carries all-time counters and no buckets, so the windows read
+  `↑0 ↓0` until traffic is seen — the all-time figures are untouched and keep
+  counting from where they were.
 
 There is no reset command. Delete `STATE_DIR/tokens.json` — with nothing
 running, or accepting that each live server's current counters are then banked
@@ -782,6 +984,12 @@ this launch as a command:
 Only what you actually chose appears — a value a profile supplied is implied by
 `--load-profile` and is deliberately not frozen into the line.
 
+The same answers are what `restart` replays, explicit flags included: a
+`--ctx`, a sampling pin kept on the instance because it had no profile to be
+saved into, an `--extra`. A value that `--save-profile` wrote back is dropped
+from the answers once the save lands, so from then on it comes from the profile
+like everything else.
+
 ## Ports and instance limit
 
 **The API lives on ports 10001-10008, and nowhere else.** Eight ports, eight
@@ -822,7 +1030,7 @@ create, store, or rotate keys**, by design:
 
 - `unsloth studio run` mints a fresh key at every launch and prints it. The
   manager captures the server's output to its log, so the key is there:
-  `grep 'API Key' /root/.unsloth-logs/<model>.log`
+  `grep 'API Key' /root/.unsloth-logs/<model>.log` (or wherever `UNSLOTH_MGR_LOG_DIR` points)
 - Keys live in `STUDIO_HOME/auth/auth.db` and are **not** tied to a single
   server. Any key already in that database authenticates against every server
   the manager starts, on any port. One long-lived key is usually what you want.
@@ -831,7 +1039,10 @@ create, store, or rotate keys**, by design:
 themselves: an explicit `--api-key` wins, then `UNSLOTH_MGR_API_KEY`, then the
 key this manager's own log already recorded for that server. Nothing new is
 stored anywhere. For `api_tester.sh`, put the key in each endpoint's `auth`
-field.
+field. On its first run it writes `.api_tester.json` (mode 600, git-ignored)
+with one endpoint per port in the pool, already carrying
+`UNSLOTH_MGR_API_KEY` if that is set. The file is never regenerated after
+that.
 
 One race worth knowing about: the log line the manager watches for to call a
 load "ready" is printed *before* the startup banner carrying the key, so the
@@ -909,7 +1120,19 @@ idle-unloaded server the first entry can be some other cached model, and
 requesting it loads that model onto the server. `test` and the keep-warm pinger
 look the id up the same way.
 
-They also send `enable_tools: false`, as `test` does. With Unsloth's
+They then send it as `repo:QUANT` (e.g. `ukisai/Swift-Qwen3.8-27B-GGUF:Q4_K_L`),
+pinned to the quant the server was launched with. `/v1/models` lists only the
+bare repo id, and naming that on an idle-unloaded server lets Studio reload
+whichever quant *it* prefers. A quant with no saved override loads on estimator
+defaults: Qwen3.8-27B launched as Q4_K_L / q8_0 KV / 262k came back from a
+bare-id reload as Q4_K_M / f16 KV / 210k, and ran the GPU out of memory on the
+first long prompt. With the quant named, the reload takes that quant's override;
+on a loaded server the same id is answered by the resident model, no reload.
+**Point your own clients at `repo:QUANT` too** — the bare id is what they will
+copy from `/v1/models`, and it is the one that drifts.
+
+They also send `enable_tools: false` and `tool_choice: "none"`, as `test`
+does. With Unsloth's
 server-side tools on, a model asked for a long technical answer stops to run web
 searches partway through. That puts network round-trips into TTFT, and on a
 live server it queues other clients behind the benchmark. The numbers describe
@@ -1004,10 +1227,16 @@ be rediscovered.
   So pass `--no-tools` unless you specifically want server-side web search and
   code execution. `start` warns when tools are on and `--parallel` is above 1,
   because the slot count is otherwise a promise the server will not keep, and
-  the TUI asks outright. A client can also opt out per request with
-  `enable_tools: false` (which is what the Studio UI sends), but most
-  OpenAI-compatible clients will not — which is why the server-level flag is
-  the one that matters. Verified: with the server started `--no-tools`, three
+  the TUI asks outright. A client can opt out per request, but not with
+  `enable_tools: false`: a server started with tools on runs `--enable-tools`,
+  a policy that outranks the request field and forces the tool loop anyway.
+  Only `tool_choice: "none"` turns it off per request. A *streamed* request
+  that gets the forced loop without Studio's `X-Unsloth-Events: 1` confirm
+  channel is refused outright — HTTP 400 `confirm_tool_calls requires
+  stream=true and the X-Unsloth-Events: 1 header` — which is what broke `test`
+  and `benchmark` on tools-on servers until they started sending
+  `tool_choice: "none"`. Most OpenAI-compatible clients send neither field,
+  which is why the server-level flag is the one that matters. Verified: with the server started `--no-tools`, three
   plain concurrent requests that send nothing special get TTFT 1.47s each and
   50.0 tok/s aggregate.
 
@@ -1015,6 +1244,14 @@ be rediscovered.
   `<repo>:<variant>`, so which quant a launch picks silently decides which
   profile it reads. `settings` lists every quant that has one, and the launch
   plan names the key it used plus any other quant carrying an override.
+
+- **Studio's per-model override save replaces the row; it does not patch it.**
+  `PUT /api/settings/openai-auto-switch/overrides` stores exactly the fields it
+  is sent (bar extra llama args and the server-tuning fields, which it carries
+  over itself), so a client that sends only the field it changed clears the
+  rest — a `gpu_ids` pin, a chat template, `disable_vision`. The manager's save
+  sends the stored row back with the edit swapped in. Any other client that
+  writes overrides has to do the same.
 
 - **A pinned sampling flag is not a default, it is an override.** See
   [Pinning sampling is a hard override](#pinning-sampling-is-a-hard-override).
@@ -1050,19 +1287,23 @@ curl -s http://gpubox.example.com:10001/v1/models -H "Authorization: Bearer $KEY
 Every setting is an environment variable, and every one has a default chosen to
 work on a fresh machine — so a clone runs without configuration.
 
-For the handful that are per-machine, copy `.env.example` to **`local.env`**
+For the handful that are per-machine, copy `local.env.example` to **`local.env`**
 beside the script and edit it. It is read at startup and is git-ignored, so
 nothing about your box ends up in the repository:
 
 ```bash
-cp .env.example local.env
+cp local.env.example local.env
 $EDITOR local.env
 ```
 
 A real environment variable always beats the file, so a systemd unit or a
 one-off `UNSLOTH_MGR_LOG_KEEP=10 python unsloth_manager.py ...` still wins.
 Only `UNSLOTH_MGR_*` names are read from it — a config file has no business
-setting `PATH`. Point `UNSLOTH_MGR_ENV_FILE` elsewhere to use a different file.
+setting `PATH`, which is also why the Hugging Face token has its own
+`UNSLOTH_MGR_HF_TOKEN` name. Everything after `=` is the value, so keep
+comments on their own lines. Point `UNSLOTH_MGR_ENV_FILE` elsewhere to use a
+different file. `api_tester.sh` reads the same file. Once it holds a key or
+token, `chmod 600` it.
 
 The two most likely to need setting are `UNSLOTH_MGR_PUBLIC_HOST` (if clients
 reach the box by a name other than its hostname) and `UNSLOTH_MGR_HF_HOME` (if
@@ -1083,8 +1324,9 @@ the weights are not in the service account's `~/.cache/huggingface`).
 | `UNSLOTH_MGR_BIND_HOST` | `0.0.0.0` | Server bind address. |
 | `UNSLOTH_MGR_PUBLIC_HOST` | this machine's hostname | Hostname printed in URLs. Only affects what is printed. |
 | `UNSLOTH_MGR_PUBLIC_SCHEME` | `http` | Scheme for those URLs. |
-| `UNSLOTH_MGR_API_KEY` | unset | Key for `test` / `benchmark` / readouts. Default: read from the server's own log. |
-| `UNSLOTH_MGR_BIN` | `unsloth` | Unsloth CLI to invoke. |
+| `UNSLOTH_MGR_API_KEY` | unset | Key for `test` / `benchmark` / readouts, and the `auth` that `api_tester.sh` seeds its endpoints with on its first run. Default: read from the server's own log. |
+| `UNSLOTH_MGR_HF_TOKEN` | unset | Hugging Face token for gated repos, passed to the servers as `HF_TOKEN`. A real `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` in the environment wins. |
+| `UNSLOTH_MGR_BIN` | `unsloth` | Unsloth CLI to invoke. A bare name is looked up on the servers' fixed `PATH` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`), not yours — use a full path for anything installed elsewhere. `doctor` checks that same `PATH`. |
 | `UNSLOTH_MGR_PER_GPU_VRAM_GB` | auto-detected | Per-GPU VRAM used for quant sizing. |
 | `UNSLOTH_MGR_STOP_TIMEOUT` | `30` | Seconds to wait for SIGTERM before SIGKILL. |
 | `UNSLOTH_MGR_LOAD_TIMEOUT` | `900` | Default readiness wait for `start`. |
@@ -1113,6 +1355,36 @@ the weights are not in the service account's `~/.cache/huggingface`).
 - Companion GGUFs (`mmproj-*` vision projectors, `mtp-*` prediction modules)
   are not servable variants and are filtered out of `list`. Unsloth picks them
   up on its own from the same directory.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Stdlib `unittest`. The tests need no server, GPU or network, and take well
+under a second. They cover the logic where a quiet regression costs data or
+a wrong number, not the plumbing:
+
+- **Override and preset payloads.** A Studio override save *replaces* the
+  row, so every field the edit did not touch (`gpu_ids`, the chat template,
+  the manual-offload layers) has to be echoed back. A preset write-back has
+  to carry through every key the chat UI owns.
+- **Save routing.** Which profile each edited value goes to, and the
+  override sync a preset save always brings along.
+- **Reload drift.** What an idle reload would silently change, the vision
+  cases included.
+- **Quant naming.** `list` and the header lookups share one rule, and
+  companion GGUFs (projectors, MTP and draft modules) are never offered as
+  quants.
+- **Throughput and token history.** The steady-rate window, and the
+  hour→day rollup, pruning and windowed totals behind the token line.
+
+Every setting is pointed at a throwaway directory before the manager is
+imported: state, logs and `studio.db`, and `UNSLOTH_MGR_ENV_FILE` is set to
+`/dev/null`. A run never reads `local.env`, never touches the real
+`tokens.json`, and never opens Studio's database. A test that needs Studio
+rows writes them to its own temporary `studio.db`.
 
 ## License
 

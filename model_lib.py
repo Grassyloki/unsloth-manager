@@ -138,6 +138,27 @@ def _iter_gguf(snapshot: str):
                        os.path.join(root, name))
 
 
+def _variant_of(reldir: str, name: str) -> str | None:
+    """The variant a GGUF belongs to, or None for a companion file.
+
+    The one naming rule for the whole module: `list` offers these names and
+    the header lookups search by them, so two copies that drifted apart would
+    leave a quant that lists fine but whose context reads as unknown.
+    """
+    # search, not match: the `-mmproj` alternative sits mid-name.
+    if _NON_VARIANT_GGUF.search(name):
+        return None
+    if reldir and _QUANT_DIR_RE.match(os.path.basename(reldir)):
+        # Quant-per-folder layout: the folder is the variant, and the
+        # shards inside it all belong to that one variant.
+        return os.path.basename(reldir)
+    m = _GGUF_VARIANT_RE.search(name)
+    # A single-file GGUF with an unrecognised tag still deserves to be
+    # listed; name it after the file so it can at least be selected.
+    variant = m.group("variant") if m else name[: -len(".gguf")]
+    return f"{reldir}/{variant}" if reldir else variant
+
+
 def _scan_snapshot(snapshot: str) -> tuple[str, dict[str, int]]:
     """Classify a snapshot as GGUF or HF-format and collect its variants.
 
@@ -149,22 +170,9 @@ def _scan_snapshot(snapshot: str) -> tuple[str, dict[str, int]]:
 
     for reldir, name, path in _iter_gguf(snapshot):
         saw_gguf = True
-        if _NON_VARIANT_GGUF.match(name):
-            continue
-
-        if reldir and _QUANT_DIR_RE.match(os.path.basename(reldir)):
-            # Quant-per-folder layout: the folder is the variant, and the
-            # shards inside it all belong to that one variant.
-            variant = os.path.basename(reldir)
-        else:
-            m = _GGUF_VARIANT_RE.search(name)
-            # A single-file GGUF with an unrecognised tag still deserves to be
-            # listed; name it after the file so it can at least be selected.
-            variant = m.group("variant") if m else name[: -len(".gguf")]
-            if reldir:
-                variant = f"{reldir}/{variant}"
-
-        variants[variant] = variants.get(variant, 0) + _real_size(path)
+        variant = _variant_of(reldir, name)
+        if variant is not None:
+            variants[variant] = variants.get(variant, 0) + _real_size(path)
 
     return ("gguf" if saw_gguf else "hf"), variants
 
@@ -390,16 +398,7 @@ def variant_gguf_path(m: ModelInfo, variant: str) -> str:
     if not m.snapshot or not variant:
         return ""
     for reldir, name, path in _iter_gguf(m.snapshot):
-        if _NON_VARIANT_GGUF.match(name):
-            continue
-        if reldir and _QUANT_DIR_RE.match(os.path.basename(reldir)):
-            found = os.path.basename(reldir)
-        else:
-            hit = _GGUF_VARIANT_RE.search(name)
-            found = hit.group("variant") if hit else name[: -len(".gguf")]
-            if reldir:
-                found = f"{reldir}/{found}"
-        if found == variant:
+        if _variant_of(reldir, name) == variant:
             return path
     return ""
 
@@ -415,3 +414,17 @@ def native_context(m: ModelInfo, variant: str = "") -> int | None:
             if path:
                 break
     return gguf_native_context(path) if path else None
+
+
+_MMPROJ_RE = re.compile(r"^mmproj|-mmproj", re.IGNORECASE)
+
+
+def has_mmproj(m: ModelInfo) -> bool:
+    """Whether the snapshot ships a vision projector Unsloth would attach.
+
+    What "vision on" means depends on this: with no projector on disk the
+    switch has nothing to attach, so on and off are the same server.
+    """
+    if not m.is_gguf or not m.snapshot:
+        return False
+    return any(_MMPROJ_RE.search(name) for _d, name, _p in _iter_gguf(m.snapshot))

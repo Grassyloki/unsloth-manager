@@ -12,6 +12,32 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/.api_tester.json"
 
+# ---------- manager settings ----------
+# The same local.env unsloth_manager.py reads, so a first run already knows
+# the port pool and the key. Parsed, not sourced: only UNSLOTH_MGR_* names,
+# and a variable already in the environment wins (the manager's TUI hand-off
+# passes its own settings down that way).
+load_env_file() {
+    local file="${UNSLOTH_MGR_ENV_FILE:-$SCRIPT_DIR/local.env}" line key val
+    [[ -r "$file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        line="${line#export }"
+        [[ "$line" == *=* ]] || continue
+        key="${line%%=*}" val="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        [[ "$key" =~ ^UNSLOTH_MGR_[A-Z0-9_]+$ ]] || continue
+        if [[ ${#val} -ge 2 && ( "$val" == \"*\" || "$val" == \'*\' ) ]]; then
+            val="${val:1:${#val}-2}"
+        fi
+        [[ -n "${!key+set}" ]] || export "$key=$val"
+    done <"$file"
+}
+load_env_file
+
 # ---------- colors ----------
 # Minimal palette: mostly terminal default, one cool accent, muted gray for chrome.
 C_RESET=$'\033[0m'
@@ -68,18 +94,26 @@ check_deps() {
 }
 
 # ---------- config ----------
+# First run only: one endpoint per port in the manager's pool, carrying
+# UNSLOTH_MGR_API_KEY when one is set. Edit or delete them freely afterwards;
+# the file is never regenerated.
 init_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        cat >"$CONFIG_FILE" <<'EOF'
-{
-  "test_prompt": "what is a buffer overflow",
-  "endpoints": [
-    { "name": "Unsloth :7100", "url": "http://localhost:7100/v1", "auth": "" },
-    { "name": "Unsloth :7101", "url": "http://localhost:7101/v1", "auth": "" },
-    { "name": "Ollama",        "url": "http://localhost:11434/v1", "auth": "" }
-  ]
-}
-EOF
+        local base="${UNSLOTH_MGR_BASE_PORT:-10001}" n="${UNSLOTH_MGR_MAX_INSTANCES:-8}"
+        local host="${UNSLOTH_MGR_BIND_HOST:-0.0.0.0}"
+        # A wildcard bind answers on loopback; a specific address may not.
+        [[ "$host" == "0.0.0.0" || "$host" == "::" ]] && host="localhost"
+        [[ "$host" == *:* ]] && host="[$host]"
+        (umask 077
+         jq -n --arg host "$host" --arg key "${UNSLOTH_MGR_API_KEY:-}" \
+               --argjson base "$base" --argjson n "$n" '{
+            test_prompt: "what is a buffer overflow",
+            endpoints: ([range($base; $base + $n)
+                         | {name: "Unsloth :\(.)",
+                            url: "http://\($host):\(.)/v1", auth: $key}]
+                        + [{name: "Ollama", url: "http://localhost:11434/v1",
+                            auth: ""}])
+          }' >"$CONFIG_FILE") || { rm -f "$CONFIG_FILE"; exit 1; }
         chmod 600 "$CONFIG_FILE"
         printf '%sCreated %s%s\n' "$C_OK" "$CONFIG_FILE" "$C_RESET"
     fi
@@ -192,15 +226,6 @@ action_menu() {
                 ;;
         esac
     done
-}
-
-# ---------- curl helper ----------
-curl_auth_args() {
-    local auth
-    auth=$(ep_auth "$1")
-    if [[ -n "$auth" ]]; then
-        printf -- '-H\nAuthorization: Bearer %s\n' "$auth"
-    fi
 }
 
 # ---------- actions ----------

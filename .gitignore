@@ -1,7 +1,9 @@
-# Per-machine settings. Copy .env.example to local.env; never commit it.
+# Per-machine settings. Copy local.env.example to local.env; never commit it.
+# (local.env.example itself matches neither pattern, so it is tracked.)
 local.env
 *.env
-!.env.example
+# api_tester.sh endpoints, which carry API keys
+.api_tester.json
 
 # Python
 __pycache__/
@@ -12,9 +14,11 @@ venv/
 
 # Runtime state and output, in case anyone points STATE_DIR/LOG_DIR here
 *.log
-*.log.[0-9]
+*.log.[0-9]*
 state.json
 groups.json
+tokens.json
+*.json.tmp
 bench-*.json
 
 # Editors and OS cruft
