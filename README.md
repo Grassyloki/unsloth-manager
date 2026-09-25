@@ -5,22 +5,22 @@ inference servers at once: an interactive curses TUI plus a CLI for starting and
 stopping servers on dedicated ports as an unprivileged user, applying Unsloth's
 own settings to headless launches, and benchmarking throughput.
 
-It is the Unsloth counterpart to the sibling
-[vllm-manager](https://github.com/Grassyloki/vllm-manager), but a launch here is
-**(model, profile, port)**, and every profile is *Unsloth's own* — read live out
-of `studio.db`, out of the Studio venv's shipped tables, or transcribed from
-Unsloth's published model guides. This tool invents no settings of its own; what
-it does is show you which source won, before the load and after it — and, when
-you change a value at launch, save it back into the Studio profile it came from.
+A launch is **(model, profile, port)**, and every profile is *Unsloth's own*
+— read live out of `studio.db`, out of the Studio venv's shipped tables, or
+transcribed from Unsloth's published model guides. This tool invents no
+settings of its own; what it does is show you which source won, before the load
+and after it — and, when you change a value at launch, save it back into the
+Studio profile it came from.
 
 Built for and tested on a **2x NVIDIA Tesla V100-SXM2 32 GB** box running
 CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
 
-## How this differs from vllm-manager
+## Design in brief
 
-- **Settings belong to Unsloth, not to this tool.** There is no `profiles.toml`.
-  You edit them on the Studio settings page and in the Preset dropdown — or on
-  the manager's own review screen at launch, which saves an edit back into the
+- **Settings belong to Unsloth, not to this tool.** It keeps no model or
+  sampling profiles of its own (`local.env` only describes the machine). You
+  edit them on the Studio settings page and in the Preset dropdown — or on the
+  manager's own review screen at launch, which saves an edit back into the
   same Studio preset or per-model override, through **Studio's own settings
   API**. The manager never opens `studio.db` for writing; see
   [Editing a profile at launch](#editing-a-profile-at-launch). The one thing it
@@ -37,8 +37,9 @@ CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
 
 **Sections**
 
-- [How this differs from vllm-manager](#how-this-differs-from-vllm-manager)
+- [Design in brief](#design-in-brief)
 - [Requirements](#requirements)
+- [Setup](#setup)
 - [Usage](#usage)
 - [Command reference](#command-reference)
 - [Where settings come from](#where-settings-come-from)
@@ -55,9 +56,9 @@ CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
 - [How servers are launched](#how-servers-are-launched)
 - [Gotchas worth knowing](#gotchas-worth-knowing)
 - [Connecting clients](#connecting-clients)
-- [Configuration](#configuration)
 - [Notes for this box](#notes-for-this-box)
 - [Tests](#tests)
+- [History](#history)
 - [License](#license)
 
 **Files**
@@ -86,8 +87,59 @@ used, which is what every model on this box resolves through anyway.
 - Root, to drop privileges to that account.
 - `whiptail`, `jq`, `curl`, `bc` for `api_tester.sh`.
 
-Check all of it, including that presets, per-model overrides and Unsloth's
-shipped default tables are all readable:
+## Setup
+
+Every setting is an environment variable, and every one has a default chosen to
+work on a fresh machine — so a clone runs without configuration.
+
+For the handful that are per-machine, copy `local.env.example` to **`local.env`**
+beside the script and edit it. It is read at startup and is git-ignored, so
+nothing about your box ends up in the repository:
+
+```bash
+cp local.env.example local.env
+$EDITOR local.env
+```
+
+A real environment variable always beats the file, so a systemd unit or a
+one-off `UNSLOTH_MGR_LOG_KEEP=10 python unsloth_manager.py ...` still wins.
+Only `UNSLOTH_MGR_*` names are read from it — a config file has no business
+setting `PATH`, which is also why the Hugging Face token has its own
+`UNSLOTH_MGR_HF_TOKEN` name. Everything after `=` is the value, so keep
+comments on their own lines. Point `UNSLOTH_MGR_ENV_FILE` elsewhere to use a
+different file. `api_tester.sh` reads the same file. Once it holds a key or
+token, `chmod 600` it.
+
+The two most likely to need setting are `UNSLOTH_MGR_PUBLIC_HOST` (if clients
+reach the box by a name other than its hostname) and `UNSLOTH_MGR_HF_HOME` (if
+the weights are not in the service account's `~/.cache/huggingface`).
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `UNSLOTH_MGR_USER` | `unsloth` | Account the servers run as. |
+| `UNSLOTH_MGR_STUDIO_HOME` | `~unsloth/.unsloth/studio` | Unsloth data root. Leave unset unless it is genuinely elsewhere — see the symlink item in [Gotchas](#gotchas-worth-knowing). |
+| `UNSLOTH_MGR_STUDIO_DB` | `<STUDIO_HOME>/studio.db` | Where presets and per-model overrides are read from. |
+| `UNSLOTH_MGR_STUDIO_ASSETS` | globbed under `<STUDIO_HOME>` | Unsloth's `assets/configs` (its shipped sampling tables). |
+| `UNSLOTH_MGR_HF_HOME` | `~<user>/.cache/huggingface` | Model cache; passed to the child as `HF_HOME`. |
+| `UNSLOTH_MGR_STATE_DIR` | `/root/.unsloth-pids` | State file directory: `state.json`, `groups.json`, `tokens.json`. |
+| `UNSLOTH_MGR_LOG_DIR` | `/root/.unsloth-logs` | Per-model server logs + benchmark JSON. |
+| `UNSLOTH_MGR_BASE_PORT` | `10001` | First port in the API pool. |
+| `UNSLOTH_MGR_MAX_INSTANCES` | `8` | Pool size, and therefore the concurrent-server cap. |
+| `UNSLOTH_MGR_GROUP_SLOTS` | `10` | Instance-group slots. |
+| `UNSLOTH_MGR_BIND_HOST` | `0.0.0.0` | Server bind address. |
+| `UNSLOTH_MGR_PUBLIC_HOST` | this machine's hostname | Hostname printed in URLs. Only affects what is printed. |
+| `UNSLOTH_MGR_PUBLIC_SCHEME` | `http` | Scheme for those URLs. |
+| `UNSLOTH_MGR_API_KEY` | unset | Key for `test` / `benchmark` / readouts, and the `auth` that `api_tester.sh` seeds its endpoints with on its first run. Default: read from the server's own log. |
+| `UNSLOTH_MGR_HF_TOKEN` | unset | Hugging Face token for gated repos, passed to the servers as `HF_TOKEN`. A real `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` in the environment wins. |
+| `UNSLOTH_MGR_BIN` | `unsloth` | Unsloth CLI to invoke. A bare name is looked up on the servers' fixed `PATH` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`), not yours — use a full path for anything installed elsewhere. `doctor` checks that same `PATH`. |
+| `UNSLOTH_MGR_PER_GPU_VRAM_GB` | auto-detected | Per-GPU VRAM used for quant sizing. |
+| `UNSLOTH_MGR_STOP_TIMEOUT` | `30` | Seconds to wait for SIGTERM before SIGKILL. |
+| `UNSLOTH_MGR_LOAD_TIMEOUT` | `900` | Default readiness wait for `start`. |
+| `UNSLOTH_MGR_LOG_KEEP` | `3` | Rotated log generations to keep. |
+| `UNSLOTH_MGR_ENV_FILE` | `local.env` beside the script | Where the per-machine settings above are read from. |
+
+Then check all of it, including that presets, per-model overrides and
+Unsloth's shipped default tables are all readable:
 
 ```bash
 python unsloth_manager.py doctor
@@ -1282,57 +1334,6 @@ curl -s http://gpubox.example.com:10001/v1/models -H "Authorization: Bearer $KEY
 `/v1` is a base URL, not a GET-able path; health checks should hit
 `/api/health` (no token) or `/v1/models` (token required).
 
-## Configuration
-
-Every setting is an environment variable, and every one has a default chosen to
-work on a fresh machine — so a clone runs without configuration.
-
-For the handful that are per-machine, copy `local.env.example` to **`local.env`**
-beside the script and edit it. It is read at startup and is git-ignored, so
-nothing about your box ends up in the repository:
-
-```bash
-cp local.env.example local.env
-$EDITOR local.env
-```
-
-A real environment variable always beats the file, so a systemd unit or a
-one-off `UNSLOTH_MGR_LOG_KEEP=10 python unsloth_manager.py ...` still wins.
-Only `UNSLOTH_MGR_*` names are read from it — a config file has no business
-setting `PATH`, which is also why the Hugging Face token has its own
-`UNSLOTH_MGR_HF_TOKEN` name. Everything after `=` is the value, so keep
-comments on their own lines. Point `UNSLOTH_MGR_ENV_FILE` elsewhere to use a
-different file. `api_tester.sh` reads the same file. Once it holds a key or
-token, `chmod 600` it.
-
-The two most likely to need setting are `UNSLOTH_MGR_PUBLIC_HOST` (if clients
-reach the box by a name other than its hostname) and `UNSLOTH_MGR_HF_HOME` (if
-the weights are not in the service account's `~/.cache/huggingface`).
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `UNSLOTH_MGR_USER` | `unsloth` | Account the servers run as. |
-| `UNSLOTH_MGR_STUDIO_HOME` | `~unsloth/.unsloth/studio` | Unsloth data root. Leave unset unless it is genuinely elsewhere — see the gotcha above. |
-| `UNSLOTH_MGR_STUDIO_DB` | `<STUDIO_HOME>/studio.db` | Where presets and per-model overrides are read from. |
-| `UNSLOTH_MGR_STUDIO_ASSETS` | globbed under `<STUDIO_HOME>` | Unsloth's `assets/configs` (its shipped sampling tables). |
-| `UNSLOTH_MGR_HF_HOME` | `~<user>/.cache/huggingface` | Model cache; passed to the child as `HF_HOME`. |
-| `UNSLOTH_MGR_STATE_DIR` | `/root/.unsloth-pids` | State file directory: `state.json`, `groups.json`, `tokens.json`. |
-| `UNSLOTH_MGR_LOG_DIR` | `/root/.unsloth-logs` | Per-model server logs + benchmark JSON. |
-| `UNSLOTH_MGR_BASE_PORT` | `10001` | First port in the API pool. |
-| `UNSLOTH_MGR_MAX_INSTANCES` | `8` | Pool size, and therefore the concurrent-server cap. |
-| `UNSLOTH_MGR_GROUP_SLOTS` | `10` | Instance-group slots. |
-| `UNSLOTH_MGR_BIND_HOST` | `0.0.0.0` | Server bind address. |
-| `UNSLOTH_MGR_PUBLIC_HOST` | this machine's hostname | Hostname printed in URLs. Only affects what is printed. |
-| `UNSLOTH_MGR_PUBLIC_SCHEME` | `http` | Scheme for those URLs. |
-| `UNSLOTH_MGR_API_KEY` | unset | Key for `test` / `benchmark` / readouts, and the `auth` that `api_tester.sh` seeds its endpoints with on its first run. Default: read from the server's own log. |
-| `UNSLOTH_MGR_HF_TOKEN` | unset | Hugging Face token for gated repos, passed to the servers as `HF_TOKEN`. A real `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` in the environment wins. |
-| `UNSLOTH_MGR_BIN` | `unsloth` | Unsloth CLI to invoke. A bare name is looked up on the servers' fixed `PATH` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`), not yours — use a full path for anything installed elsewhere. `doctor` checks that same `PATH`. |
-| `UNSLOTH_MGR_PER_GPU_VRAM_GB` | auto-detected | Per-GPU VRAM used for quant sizing. |
-| `UNSLOTH_MGR_STOP_TIMEOUT` | `30` | Seconds to wait for SIGTERM before SIGKILL. |
-| `UNSLOTH_MGR_LOAD_TIMEOUT` | `900` | Default readiness wait for `start`. |
-| `UNSLOTH_MGR_LOG_KEEP` | `3` | Rotated log generations to keep. |
-| `UNSLOTH_MGR_ENV_FILE` | `local.env` beside the script | Where the per-machine settings above are read from. |
-
 ## Notes for this box
 
 - The GGUF quant is the main VRAM lever. `list --variants` shows each quant's
@@ -1385,6 +1386,12 @@ imported: state, logs and `studio.db`, and `UNSLOTH_MGR_ENV_FILE` is set to
 `/dev/null`. A run never reads `local.env`, never touches the real
 `tokens.json`, and never opens Studio's database. A test that needs Studio
 rows writes them to its own temporary `studio.db`.
+
+## History
+
+unsloth-manager started as a fork of
+[vllm-manager](https://github.com/Grassyloki/vllm-manager) and is now far ahead
+of it. The curses widgets in `tui_lib.py` are still shared with it.
 
 ## License
 
