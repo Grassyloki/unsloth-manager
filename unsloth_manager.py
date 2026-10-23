@@ -514,7 +514,8 @@ def cmd_keepalive(args):
                         "messages": [{"role": "user", "content": "ping"}],
                         "max_tokens": 1,
                         # Never let a keepalive drag Unsloth's tool machinery
-                        # in: it would serialise /v1 behind this ping. A
+                        # in: a one-token ping has no use for a web search,
+                        # and older builds serialised /v1 behind it. A
                         # server launched with tools on overrides
                         # enable_tools; only tool_choice "none" turns the
                         # loop off there.
@@ -816,16 +817,222 @@ def _gpu_usage_split(timeout: float = 6.0,
     return split
 
 
-def _read_mem_gb() -> tuple[int, int]:
+def _read_kb_fields(path: str) -> dict[str, int]:
+    """`Key:   123 kB` lines -- /proc/meminfo and /proc/<pid>/status -- as
+    {key: kB}. Lines whose value is not a number are skipped."""
+    out = {}
+    with open(path) as f:
+        for line in f:
+            k, _, rest = line.partition(":")
+            parts = rest.split()
+            if parts and parts[0].isdigit():
+                out[k] = int(parts[0])
+    return out
+
+
+# hwmon drivers that report the CPU package rather than a board or a disk.
+_CPU_HWMON = ("k10temp", "zenpower", "coretemp", "cpu_thermal", "soc_thermal")
+
+
+def _cpu_temp_c(root: str = "/sys/class/hwmon") -> float | None:
+    """The hottest CPU package, in °C, or None if no sensor says.
+
+    One reading per chip, so a two-die Threadripper or a two-socket Xeon
+    reports its hotter half. On AMD, Tdie wins over Tctl where both exist:
+    first- and second-generation Threadripper add a fixed 27°C to Tctl for
+    fan control, and Tdie is the real die. Intel's is "Package id N".
+    """
+    best = None
     try:
-        with open("/proc/meminfo") as f:
-            info = {}
-            for line in f:
-                k, _, rest = line.partition(":")
-                info[k] = int(rest.split()[0])
-        return info["MemTotal"] // 1048576, info["MemAvailable"] // 1048576
-    except (OSError, KeyError, ValueError, IndexError):
-        return 0, 0
+        chips = os.listdir(root)
+    except OSError:
+        return None
+    for chip in chips:
+        d = os.path.join(root, chip)
+        try:
+            with open(os.path.join(d, "name")) as f:
+                if f.read().strip() not in _CPU_HWMON:
+                    continue
+            names = os.listdir(d)
+        except OSError:
+            continue
+        temps = {}
+        for n in names:
+            if not (n.startswith("temp") and n.endswith("_input")):
+                continue
+            try:
+                with open(os.path.join(d, n)) as f:
+                    c = int(f.read().strip()) / 1000
+            except (OSError, ValueError):
+                continue
+            try:
+                with open(os.path.join(d, n[:-6] + "_label")) as f:
+                    label = f.read().strip()
+            except OSError:
+                label = n
+            temps[label] = c
+        if not temps:
+            continue
+        pkg = [c for k, c in temps.items() if k.startswith("Package id")]
+        c = (temps.get("Tdie") or temps.get("Tctl")
+             or (max(pkg) if pkg else max(temps.values())))
+        best = c if best is None else max(best, c)
+    return best
+
+
+_CPU_NAME: str | None = None
+
+
+def _cpu_name() -> str:
+    """The CPU's model, without the trademark and core-count noise."""
+    global _CPU_NAME
+    if _CPU_NAME is None:
+        name = ""
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        name = line.partition(":")[2]
+                        break
+        except OSError:
+            pass
+        name = re.sub(r"\((R|TM|tm)\)|\bCPU\b|\bProcessor\b|\d+-Core|@.*",
+                      "", name)
+        _CPU_NAME = " ".join(name.split())
+    return _CPU_NAME
+
+
+def _cpu_sample(uid: int, pgids: set[int]) -> dict:
+    """One snapshot of CPU time, and of what our processes hold in memory.
+
+    `procs` maps each pid running as `uid`, or sitting in one of `pgids`, to
+    (cpu ticks, start tick, RSS kB, swap kB). RSS here is anonymous plus
+    shared memory: llama-server's mmapped weights are page cache, which
+    MemAvailable already counts as free, so including them would credit
+    unsloth with memory the kernel can take back.
+    """
+    with open("/proc/stat") as f:
+        vals = [int(v) for v in f.readline().split()[1:]]
+    # user nice system idle iowait irq softirq steal; guest time is already
+    # inside user and nice.
+    total = sum(vals[:8])
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+    with open("/proc/uptime") as f:
+        at = float(f.read().split()[0]) * _CLK_TCK
+
+    procs = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            if (os.stat(f"/proc/{entry}").st_uid != uid
+                    and os.getpgid(pid) not in pgids):
+                continue
+            with open(f"/proc/{entry}/stat") as f:
+                # comm is in parentheses and may hold spaces or ")".
+                fields = f.read().rpartition(")")[2].split()
+            status = _read_kb_fields(f"/proc/{entry}/status")
+        except (OSError, ValueError):
+            continue
+        try:
+            ticks, start = int(fields[11]) + int(fields[12]), int(fields[19])
+        except (IndexError, ValueError):
+            continue
+        rss = status.get("RssAnon", 0) + status.get("RssShmem", 0)
+        procs[pid] = (ticks, start, rss, status.get("VmSwap", 0))
+    return {"busy": total - idle, "total": total, "at": at, "procs": procs}
+
+
+def _cpu_split(prev: dict, cur: dict) -> tuple[float, float] | None:
+    """(busy %, ours %) of the whole machine between two _cpu_sample()s.
+
+    A process present in both is charged what it used in between; one that
+    started since `prev` is charged everything it has used, and one that
+    merely became ours (a pid that was always there) is charged nothing,
+    because its earlier time predates the window. A recycled pid is told
+    apart by its start tick.
+    """
+    span = cur["total"] - prev["total"]
+    if span <= 0:
+        return None
+    ours = 0
+    for pid, (ticks, start, _, _) in cur["procs"].items():
+        was = prev["procs"].get(pid)
+        if was and was[1] == start:
+            ours += max(0, ticks - was[0])
+        elif start >= prev["at"]:
+            ours += ticks
+    busy = 100 * max(0, cur["busy"] - prev["busy"]) / span
+    return busy, min(busy, 100 * ours / span)
+
+
+_CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+_CPU_PREV: dict | None = None
+# A sample older than this is too stale to difference against: the reading
+# would be an average over however long the user sat in a submenu.
+_CPU_PREV_MAX_AGE = 30.0
+
+
+def _host_usage_split() -> dict | None:
+    """CPU, RAM and swap, each split into 'ours' vs 'other', for the bars.
+
+    "Ours" is every process running as RUN_USER, plus anything in a process
+    group a managed server leads -- the same servers the GPU split credits,
+    and whatever else runs as that user. Sizes are kB; None off Linux.
+    """
+    global _CPU_PREV
+    try:
+        uid = pwd.getpwnam(RUN_USER).pw_uid
+    except KeyError:
+        uid = -1
+    pgids = set()
+    for pid in _managed_pids():
+        try:
+            pgids.add(os.getpgid(pid))
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        prev = _CPU_PREV
+        if (prev is None
+                or time.monotonic() - prev["mono"] > _CPU_PREV_MAX_AGE):
+            # Nothing recent to difference against: take a short window now
+            # rather than show nothing until the next redraw.
+            prev = _cpu_sample(uid, pgids)
+            time.sleep(0.25)
+        cur = _cpu_sample(uid, pgids)
+        cur["mono"] = time.monotonic()
+        _CPU_PREV = cur
+        mem = _read_kb_fields("/proc/meminfo")
+    except (OSError, ValueError, IndexError):
+        return None
+
+    split = _cpu_split(prev, cur)
+    mem_used = mem.get("MemTotal", 0) - mem.get("MemAvailable", 0)
+    swap_used = mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)
+    # Shared memory mapped by several of our processes is counted once per
+    # process; the cap keeps that from claiming more than is in use.
+    rss = sum(p[2] for p in cur["procs"].values())
+    swp = sum(p[3] for p in cur["procs"].values())
+    return {
+        "cpu_pct": split[0] if split else None,
+        "cpu_ours_pct": split[1] if split else None,
+        "cpu_temp_c": _cpu_temp_c(),
+        "cpu_threads": os.cpu_count() or 0,
+        "cpu_name": _cpu_name(),
+        "mem_total_kb": mem.get("MemTotal", 0),
+        "mem_used_kb": mem_used,
+        "mem_ours_kb": min(rss, mem_used),
+        "swap_total_kb": mem.get("SwapTotal", 0),
+        "swap_used_kb": swap_used,
+        "swap_ours_kb": min(swp, swap_used),
+    }
+
+
+def _fmt_kb(kb: int) -> str:
+    """kB as G: one decimal under 10G, where a whole number hides too much."""
+    g = kb / 1048576
+    return f"{g:.1f}" if g < 10 else f"{g:.0f}"
 
 
 # -- bars --------------------------------------------------------------------
@@ -923,15 +1130,52 @@ def _gpu_bar_line(g, width=20):
     return line
 
 
-def _ram_bar_line(used_gb, total_gb, width=20):
+def _split_bar(label, ours, used, total, width=20):
+    """`label [ours|other|free]` -- the GPU bar's two tones, for any total."""
     import curses
-    segs = _stacked_bar([(used_gb, _C_CYAN)], total_gb, width)
-    line = [("  ", 0), ("RAM  ", curses.A_BOLD),
-            ("[", curses.color_pair(_C_DIM))]
+    dim = curses.color_pair(_C_DIM)
+    segs = _stacked_bar(
+        [(ours, _C_GREEN), (max(0, used - ours), _C_YELLOW)], total, width)
+    line = [(f"{label:<5}", curses.A_BOLD), ("[", dim)]
     for text, attr in segs:
         line.append((text, curses.color_pair(attr)))
-    line.append(("] ", curses.color_pair(_C_DIM)))
-    line.append((f"{used_gb}/{total_gb}G", curses.color_pair(_C_DIM)))
+    line.append(("] ", dim))
+    return line
+
+
+def _cpu_bar_line(h, width=20):
+    import curses
+    dim = curses.color_pair(_C_DIM)
+    pct, ours = h["cpu_pct"], h["cpu_ours_pct"]
+    line = [("  ", 0)] + _split_bar("CPU", ours or 0, pct or 0, 100, width)
+    # Padded to the memory figure's column, so the temperature lines up with
+    # the GPUs' readings rather than floating.
+    line.append(((f"{pct:.0f}%" if pct is not None else "-").ljust(7),
+                 curses.color_pair(_level_color(pct)) if pct is not None
+                 else dim))
+    temp = h["cpu_temp_c"]
+    line.append(((f"  {temp:.0f}°C" if temp is not None else "  -").ljust(8),
+                 curses.color_pair(_temp_color(temp)) if temp is not None
+                 else dim))
+    line.append((f"  {h['cpu_threads']} threads  {h['cpu_name'][:30]}", dim))
+    return line
+
+
+def _mem_bar_line(h, width=20):
+    """RAM and swap side by side, each split like the GPU memory bars."""
+    import curses
+    dim = curses.color_pair(_C_DIM)
+    tot, used = h["mem_total_kb"], h["mem_used_kb"]
+    line = [("  ", 0)] + _split_bar("RAM", h["mem_ours_kb"], used, tot, width)
+    line.append((f"{_fmt_kb(used)}/{_fmt_kb(tot)}G".ljust(9), dim))
+    stot = h["swap_total_kb"]
+    if stot:
+        sused = h["swap_used_kb"]
+        line += [(" ", 0)] + _split_bar("Swap", h["swap_ours_kb"], sused,
+                                         stot, width)
+        line.append((f"{_fmt_kb(sused)}/{_fmt_kb(stot)}G", dim))
+    else:
+        line += [(" ", 0), ("Swap ", curses.A_BOLD), ("none", dim)]
     return line
 
 
@@ -2049,30 +2293,19 @@ def _print_launch_plan(lb: Launch, argv: list[str], args=None,
     if others:
         print(f"      other quants with an override: {', '.join(others)}")
 
-    # Measured on this box, both models: server-side tools serialise /v1 --
-    # every request waits for the one before it, and single-request throughput
-    # drops ~3.5x as well. llama-server's slots are fine; the tool layer above
-    # them is what queues. Worth saying at launch, because the slot count in
-    # the plan above is otherwise a promise the server will not keep.
-    slots = lb.parallel if lb.parallel is not None else 4
+    # Tools used to serialise /v1 (2026-09: 3 concurrent requests 3-7x slower
+    # with tools on). Re-measured on unsloth 2026.10.3, tools on vs off at 1-6
+    # concurrent requests: no difference, and a request mid-web-search did not
+    # hold up the others. What is left worth saying at launch is what tools
+    # on does, and that a client cannot opt out the way it would expect to.
     if lb.tools is False:
-        # Say it plainly rather than leaving the absence of a warning to carry
-        # the message: this is the setting that decides whether the slot count
-        # above is real.
-        print(f"\n    tools:       off — {slots} slot"
-              f"{'s' if slots != 1 else ''} decode concurrently. No "
-              f"server-side web\n                 search or code execution.")
-    elif slots > 1:
-        print(f"\n    tools:       WARNING — Unsloth's server-side tools are ON "
-              f"(the default), and they\n                 serialise /v1: "
-              f"{slots} slots will decode one request at a time.\n"
-              f"                 Measured here: 3 concurrent requests ran "
-              f"6.8x slower with tools\n                 on than off, and "
-              f"single-request throughput was 3.5x lower.\n"
-              f"                 Pass --no-tools unless you actually want "
-              f"server-side web/code\n                 execution. A client's "
-              f"enable_tools: false does NOT opt out\n                 here "
-              f"(the launch policy outranks it); send tool_choice: \"none\".")
+        print("\n    tools:       off — no server-side web search or code "
+              "execution.")
+    else:
+        print("\n    tools:       on — the model can run web search and code "
+              "execution on this\n                 server mid-answer. A "
+              "client's enable_tools: false does NOT opt\n                 out "
+              "(the launch policy outranks it); send tool_choice: \"none\".")
 
     after = None
     if save is not None:
@@ -3105,7 +3338,7 @@ def cmd_status(args):
 
     gsplit = _gpu_usage_split()
     if gsplit:
-        print("  GPUs")
+        print("  Host")
         for g in gsplit:
             pct = 100 * g["used_mb"] // max(1, g["total_mb"])
             live = []
@@ -3123,9 +3356,25 @@ def cmd_status(args):
                   f"other {g['other_mb'] // 1024}G"
                   + ("   " + "  ".join(live) if live else ""))
 
-    tot, avail = _read_mem_gb()
-    if tot:
-        print(f"    RAM  {tot - avail}/{tot}G used")
+    host = _host_usage_split()
+    if host:
+        if not gsplit:
+            print("  Host")
+        pct, ours = host["cpu_pct"], host["cpu_ours_pct"]
+        temp = host["cpu_temp_c"]
+        print("    CPU  "
+              + (f"{pct:.0f}% used  ours {ours:.0f}%  other {pct - ours:.0f}%"
+                 if pct is not None else "-")
+              + (f"   {temp:.0f}°C" if temp is not None else "")
+              + f"   {host['cpu_threads']} threads  {host['cpu_name']}")
+        for name, key in (("RAM ", "mem"), ("Swap", "swap")):
+            tot, used = host[f"{key}_total_kb"], host[f"{key}_used_kb"]
+            if not tot:
+                print(f"    {name} none")
+                continue
+            ours = host[f"{key}_ours_kb"]
+            print(f"    {name} {_fmt_kb(used)}/{_fmt_kb(tot)}G used  "
+                  f"ours {_fmt_kb(ours)}G  other {_fmt_kb(used - ours)}G")
     print()
 
 
@@ -3161,7 +3410,8 @@ def _stream_completion(port: int, model_id: str, api_key: str, prompt: str,
         "stream": True,
         # Measure the model, not Unsloth's tool layer: with tools on, the
         # model may stop to run web searches mid-answer, which puts network
-        # round-trips into TTFT and serialises /v1 behind this request.
+        # round-trips into TTFT (and, on pre-2026.10 builds, serialised /v1
+        # behind this request).
         #
         # enable_tools alone is not enough: a server launched with tools on
         # (--enable-tools) outranks it, forces the tool loop anyway, and then
@@ -4028,32 +4278,29 @@ def _tui_pick_variant(stdscr, repo_id: str):
     return "" if idx == len(names) else names[idx]
 
 
-def _tui_pick_tools(stdscr, slots: int):
+def _tui_pick_tools(stdscr):
     """Server-side tools on or off. Returns True/False, or None on cancel.
 
-    Asked explicitly rather than left at Unsloth's default because the default
-    quietly costs every bit of the concurrency the slot count advertises --
-    measured on this box, not inferred. `slots` is the count the launch will
-    really ask for.
+    Asked explicitly rather than left at Unsloth's default because tools on
+    lets the model run web searches and code on this server, and a client's
+    enable_tools: false does not turn that off.
     """
     import curses
-    warn = curses.color_pair(_C_YELLOW) | curses.A_BOLD
     dim = curses.color_pair(_C_DIM)
     header = [
-        ("Unsloth's server-side tools SERIALISE /v1.", warn),
-        (f"With them on, this model's {slots} decode slots run one request at "
-         f"a time.", dim),
+        ("Unsloth's server-side tools let the model run web search and code",
+         curses.color_pair(_C_YELLOW) | curses.A_BOLD),
+        ("execution on this server, partway through an answer.", dim),
         ("", 0),
-        ("Measured here, 3 concurrent requests:", dim),
-        ("   Qwen3.8-27B   tools on 7.1 tok/s   ->  off 48.5 tok/s", dim),
-        ("   Qwen3.6-35B   tools on 37.1 tok/s  ->  off 110.6 tok/s", dim),
-        ("Single request is ~3.5x slower with tools on, too.", dim),
+        ("With them on, a client's enable_tools: false does NOT opt out;",
+         dim),
+        ("only tool_choice: \"none\" does, per request.", dim),
+        ("No throughput cost measured on unsloth 2026.10.3 (1-6 concurrent "
+         "requests).", dim),
     ]
     items = [
-        ("  Tools OFF — full concurrency, no server-side web/code  "
-         "(recommended)", curses.color_pair(_C_GREEN)),
-        ("  Tools ON  — server-side web search + code execution, "
-         "serialised", 0),
+        ("  Tools OFF — no server-side web/code", 0),
+        ("  Tools ON  — server-side web search + code execution", 0),
     ]
     idx = tui.select(stdscr, "Server-side tools", items, header=header)
     if idx < 0:
@@ -4435,10 +4682,7 @@ def _tui_act_start(stdscr):
     if reviewed is None:
         return
     edits, save, lb = reviewed
-    # After the review: the slot count the warning quotes is the one this
-    # launch will really ask for, edits included.
-    tools = _tui_pick_tools(stdscr,
-                            lb.parallel if lb.parallel is not None else 4)
+    tools = _tui_pick_tools(stdscr)
     if tools is None:
         return
     keep_warm = _tui_pick_keep_warm(stdscr)
@@ -4472,6 +4716,33 @@ _LLAMA_PORT_CACHE: dict[int, tuple[float, int, int]] = {}
 _SLOT_CACHE: dict[int, tuple[float, tuple[int, int] | None]] = {}
 _LLAMA_PORT_TTL = 30.0
 _SLOT_TTL = 3.0
+
+# llama-server's bearer key, per llama-server port. Since unsloth 2026.10.5 it
+# is launched with --api-key-file, and /slots and /metrics answer 401 without
+# it -- which reads as "no answer", so the live figures silently vanish. A new
+# key file comes with every load, but so does a new port, so the pair stays
+# consistent keyed this way.
+_LLAMA_KEYS: dict[int, str] = {}
+
+
+def _llama_key_from_argv(argv: list[bytes]) -> str:
+    """The key llama-server was told to require, or "" if none."""
+    for i, tok in enumerate(argv[:-1]):
+        if tok == b"--api-key":
+            return argv[i + 1].decode("utf-8", "replace")
+        if tok == b"--api-key-file":
+            try:
+                with open(argv[i + 1], encoding="utf-8") as f:
+                    return f.readline().strip()
+            except OSError:
+                return ""
+    return ""
+
+
+def _llama_get(port: int, path: str, timeout: float = 0.6):
+    """GET one of llama-server's own endpoints, with its key if it has one."""
+    return _http(f"http://127.0.0.1:{port}{path}",
+                 api_key=_LLAMA_KEYS.get(port, ""), timeout=timeout)
 
 
 def _llama_server_proc(pid: int, fresh: bool = False) -> tuple[int, int]:
@@ -4521,6 +4792,7 @@ def _llama_server_proc(pid: int, fresh: bool = False) -> tuple[int, int]:
                     break
             if port:
                 child = int(entry)
+                _LLAMA_KEYS[port] = _llama_key_from_argv(argv)
                 break
     except OSError:
         child = port = 0
@@ -4557,7 +4829,7 @@ def _read_metrics(port: int) -> dict | None:
     if hit and now - hit[0] < _METRICS_TTL:
         return hit[1]
     try:
-        with _http(f"http://127.0.0.1:{port}/metrics", timeout=0.6) as r:
+        with _llama_get(port, "/metrics") as r:
             text = r.read().decode("utf-8", "replace")
     except (urllib.error.URLError, OSError, ValueError):
         return None
@@ -4694,7 +4966,7 @@ def _slot_usage(entry: dict) -> dict | None:
         _SLOT_CACHE[pid] = (now, usage)
         return usage
     try:
-        with _http(f"http://127.0.0.1:{port}/slots", timeout=0.6) as r:
+        with _llama_get(port, "/slots") as r:
             slots = json.loads(r.read().decode())
         if isinstance(slots, list) and slots:
             usage = {
@@ -5202,7 +5474,8 @@ def _settings_segments(name: str, entry: dict, terse: bool = False,
     if spec and spec != "auto":
         add("spec", spec, hot)
 
-    # Tools ON is the notable state here, not off: it silently serialises /v1.
+    # Tools ON is the notable state here, not off: it lets the model run web
+    # searches and code on this server, and enable_tools: false cannot stop it.
     tools = eff.get("tools")
     if tools is False:
         add("tools", "tools off", ok)
@@ -5249,7 +5522,7 @@ def _settings_segments(name: str, entry: dict, terse: bool = False,
                 parts["samp"] = [("| ", cool)] + bits
 
     # Truncation is what decides what a narrow line shows, so terse leads with
-    # the settings that cost the most when wrong: tools serialises /v1, and
+    # the settings that cost the most when wrong: tools runs server-side code, and
     # the sampling pins change what the model writes.
     # Logical order reads best; importance order only earns its keep when the
     # line is going to be cut, so choose by whether it actually fits.
@@ -5516,10 +5789,12 @@ def _tui_main(stdscr):
             # Budget rows before drawing: the menu is the point of this
             # screen, so a full complement of servers must not push it off.
             rows, cols = stdscr.getmaxyx()
-            gpu_rows = (len(_gpus()) + 1) if _gpus() else 1
-            # title, blanks, section headers, token window line, gpu bars,
-            # legend, ram, separator
-            chrome = 12 + gpu_rows
+            # gpu bars, cpu, legend (ram and the section header are in the
+            # 12); with no GPUs, the "unavailable" line stands in for both.
+            host_rows = (len(_gpus()) + 2) if _gpus() else 2
+            # title, blanks, section headers, token window line, host bars,
+            # legend, ram + swap, separator
+            chrome = 12 + host_rows
             avail = max(1, rows - chrome - _MENU_MIN_ROWS)
             two_line = len(running) * 2 <= avail
             # Narrow terminals drop the values that are already at a default
@@ -5626,25 +5901,28 @@ def _tui_main(stdscr):
         header.append(("", 0))
         gsplit = _gpu_usage_split()
         if gsplit:
-            header.append(("GPUs (live, actual): memory · compute · "
+            header.append(("Host (live, actual): memory · compute · "
                            "temperature · power", curses.A_BOLD))
             for g in gsplit:
                 header.append(_gpu_bar_line(g))
-            header.append([
-                ("    ", 0),
-                ("█", curses.color_pair(_C_GREEN)),
-                (" unsloth   ", curses.color_pair(_C_DIM)),
-                ("█", curses.color_pair(_C_YELLOW)),
-                (" other   ", curses.color_pair(_C_DIM)),
-                ("░", curses.color_pair(_C_DIM)),
-                (" free", curses.color_pair(_C_DIM)),
-            ])
         else:
             header.append(("GPUs: nvidia-smi unavailable", curses.A_DIM))
 
-        tot, avail = _read_mem_gb()
-        if tot:
-            header.append(_ram_bar_line(tot - avail, tot))
+        host = _host_usage_split()
+        if host:
+            header.append(_cpu_bar_line(host))
+            header.append(_mem_bar_line(host))
+        # One legend for every bar above it: GPU memory, CPU, RAM and swap
+        # are all split the same way.
+        header.append([
+            ("    ", 0),
+            ("█", curses.color_pair(_C_GREEN)),
+            (" unsloth   ", curses.color_pair(_C_DIM)),
+            ("█", curses.color_pair(_C_YELLOW)),
+            (" other   ", curses.color_pair(_C_DIM)),
+            ("░", curses.color_pair(_C_DIM)),
+            (" free", curses.color_pair(_C_DIM)),
+        ])
         return header
 
     while True:

@@ -199,7 +199,10 @@ Nothing above `llama-server` reports either: Unsloth's status carries the slot
 its `/slots` and `/metrics`. Each is fetched at most once per redraw — a
 3-second cache on `/slots`, 2.5 on `/metrics`, whose one response serves both
 the rate and the [token totals](#tokens-churned) — and both carry a 0.6s
-timeout, so the 5-second redraw never waits on them.
+timeout, so the 5-second redraw never waits on them. Since unsloth 2026.10.5,
+`llama-server` is launched with `--api-key-file` and answers both with 401
+without it, so the key is read from the same command line the port comes
+from. Miss it and occupancy, tok/s and token counting all go blank together.
 
 An idle-unloaded model still shows `0/2sl`, because with nothing loaded "no
 sessions" is a fact rather than a guess, and the total is the slot count it
@@ -269,21 +272,19 @@ weight alone, which here is the one quant with *no* saved profile. Pick
 explicitly when a profile exists.
 
 The tools step is asked outright rather than left at Unsloth's default,
-because the default silently costs every bit of the concurrency the slot count
-promises. It shows the measured numbers and names the slot count this launch
-will actually ask for:
+because tools on lets the model run web searches and code on this server, and
+a client's `enable_tools: false` does not turn that off:
 
 ```
-Unsloth's server-side tools SERIALISE /v1.
-With them on, this model's 3 decode slots run one request at a time.
+Unsloth's server-side tools let the model run web search and code
+execution on this server, partway through an answer.
 
-Measured here, 3 concurrent requests:
-   Qwen3.8-27B   tools on 7.1 tok/s   ->  off 48.5 tok/s
-   Qwen3.6-35B   tools on 37.1 tok/s  ->  off 110.6 tok/s
-Single request is ~3.5x slower with tools on, too.
+With them on, a client's enable_tools: false does NOT opt out;
+only tool_choice: "none" does, per request.
+No throughput cost measured on unsloth 2026.10.3 (1-6 concurrent requests).
 
-  Tools OFF — full concurrency, no server-side web/code  (recommended)
-  Tools ON  — server-side web search + code execution, serialised
+  Tools OFF — no server-side web/code
+  Tools ON  — server-side web search + code execution
 ```
 
 The choice is recorded, so `restart` keeps it; `restart --tools/--no-tools`
@@ -389,7 +390,7 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 
 | Flag | Meaning |
 |---|---|
-| `--tools` / `--no-tools` | Unsloth's server-side web/code tools. Default on — and it serialises `/v1`. |
+| `--tools` / `--no-tools` | Unsloth's server-side web/code tools. Default on. Clients opt out per request with `tool_choice: "none"`, not `enable_tools: false`. |
 | `--keep-warm` / `--no-keep-warm` | Hold this server against Studio's idle unload. Default off. |
 | `--wait N` | Seconds to wait for readiness; `0` returns immediately. Default `LOAD_TIMEOUT`. |
 | `--save-profile` | Once the model has loaded, write the values given as flags back into the profile they override — the Studio preset and/or this quant's per-model override. See [Editing a profile at launch](#editing-a-profile-at-launch). |
@@ -434,19 +435,36 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | **Studio Presets** | What the Studio UI has saved. |
 | **Environment Check** | `doctor`. |
 
-Above the menu, each GPU gets one live line, refreshed with the rest of the
-header and laid out like btop's GPU box:
+Above the menu, each GPU gets one live line, then one for the CPU and one for
+RAM and swap, all refreshed with the rest of the header and laid out like
+btop's boxes:
 
 ```
 GPU1 [████████████████░░░░] 26/32G   use ■■■■■■■■ 98%  82°C   pwr ■■■■···· 147/300W  Tesla V100-SXM2-32GB
+CPU  [███░░░░░░░░░░░░░░░░░] 14%      43°C    32 threads  AMD Ryzen Threadripper 2950X
+RAM  [████░░░░░░░░░░░░░░░░] 4.6/23G   Swap [███░░░░░░░░░░░░░░░░░] 2.9/23G
 ```
 
-Memory is split into this manager's servers (green) and everything else
-(yellow). `use` is compute utilisation and `pwr` is draw against the card's
+Every bar is split the same way: green is unsloth, yellow is everything else.
+On a GPU, unsloth means this manager's servers and their process groups, as
+`nvidia-smi` attributes memory by pid. On the CPU, RAM and swap it is those
+plus anything else running as the `unsloth` user (`UNSLOTH_MGR_USER`).
+`use` is compute utilisation and `pwr` is draw against the card's
 power limit; both meters shade green → yellow → red cell by cell, and the
-temperature turns yellow at 70°C and red at 85°C. A sensor the card does not
-report shows `-`. `status` prints the same figures, and all of them come from
-the single `nvidia-smi` query the memory bars already made.
+temperatures turn yellow at 70°C and red at 85°C. A sensor the card does not
+report shows `-`. The GPU figures all come from the single `nvidia-smi` query
+the memory bars already made.
+
+The host lines read `/proc` and `/sys` directly. CPU is busy time across every
+thread since the last redraw (the first draw samples for a quarter second).
+The unsloth share is CPU time that unsloth's processes used in that window.
+RAM is `MemTotal − MemAvailable`, and unsloth's share is its processes'
+anonymous plus shared memory. That leaves out llama-server's mmapped weights,
+which are page cache that the kernel already counts as available. Swap is each
+process's `VmSwap`. The temperature is the hottest CPU package
+(`k10temp`/`zenpower`/`coretemp`). On AMD it reads `Tdie`, not `Tctl`, because
+first- and second-generation Threadripper add 27°C to `Tctl`.
+`status` prints the same figures.
 
 Every screen takes Up/Down/Home/End, Enter to choose, and Esc or `q` to back
 out — cancelling any step of a flow abandons the whole action rather than
@@ -855,9 +873,10 @@ python unsloth_manager.py keepalive <model>        # run one in the foreground
 The interval is half the configured TTL, clamped to 30–600s, so two pings fit
 in every idle window. Only a **POST to an inference path** stamps activity in
 Studio's tracker (`LlamaKeepWarmMiddleware`), so the ping is a real one-token
-completion — with `enable_tools: false` and `tool_choice: "none"`, because
-otherwise the ping itself would serialise `/v1` behind the tool machinery (on a
-tools-on server only the second one works; see [Gotchas](#gotchas-worth-knowing)).
+completion — with `enable_tools: false` and `tool_choice: "none"`, because a
+ping has no business running a web search, and on older Studio builds it would
+have serialised `/v1` behind the tool machinery (on a tools-on server only the
+second field works; see [Gotchas](#gotchas-worth-knowing)).
 
 The pinger is recorded in the state file and killed by `stop` / `stop-all`
 before the server it was holding: a survivor would keep POSTing at a dead port
@@ -1187,9 +1206,9 @@ They also send `enable_tools: false` and `tool_choice: "none"`, as `test`
 does. With Unsloth's
 server-side tools on, a model asked for a long technical answer stops to run web
 searches partway through. That puts network round-trips into TTFT, and on a
-live server it queues other clients behind the benchmark. The numbers describe
-the model, not the tool layer. What tools on costs a server is covered in
-[Gotchas](#gotchas-worth-knowing).
+live server it used to queue other clients behind the benchmark. The numbers
+describe the model, not the tool layer. What tools on does to a server is
+covered in [Gotchas](#gotchas-worth-knowing).
 
 Two honest caveats about the numbers:
 
@@ -1256,41 +1275,40 @@ be rediscovered.
 - **A fresh API key is minted per launch**, but old keys keep working — they
   live in `STUDIO_HOME/auth/auth.db`, not in the server.
 
-- **Unsloth's server-side tools are on by default, and they serialise `/v1`.**
-  This is the single biggest performance trap here. With tools on, concurrent
-  requests queue behind each other no matter how many decode slots
-  `--parallel` bought you, and single-request throughput drops too. Measured on
-  this box, 3 concurrent 160-token requests:
+- **Unsloth's server-side tools are on by default, and a client cannot opt
+  out the way it would expect to.** A server started with tools on runs
+  `--enable-tools`, a policy that outranks a request's `enable_tools: false` and
+  forces the tool loop anyway. Only `tool_choice: "none"` turns it off per
+  request. Most OpenAI-compatible clients send neither field, so on a tools-on
+  server the model can stop to run web searches or code mid-answer, and the
+  server-level flag is the one that decides it. `start` says which way a launch
+  goes, and the TUI asks outright. `test` and `benchmark` send both fields.
 
-  | | slots | tools on | tools off |
-  |---|---|---|---|
-  | Qwen3.8-27B | 3 | 7.1 tok/s, TTFT 2.0/26.7/39.8s | **48.5 tok/s**, TTFT 0.42s x3 |
-  | Qwen3.6-35B | 2 | 37.1 tok/s, TTFT 2.2/10.3/11.6s | **110.6 tok/s**, 2 parallel + 1 queued |
+  **Tools used to serialise `/v1`; on unsloth 2026.10.3 they do not.** On
+  2026-09 builds, concurrent requests queued behind each other with tools on,
+  whatever `--parallel` bought, and single requests slowed too (3 concurrent
+  160-token requests: Qwen3.8-27B 7.1 tok/s on vs 48.5 off; Qwen3.6-35B 37.1
+  vs 110.6). Re-measured 2026-10-09 on 2026.10.3, Ornith-1.5-35B-A3B, 3 slots,
+  tools on vs `tool_choice: "none"` on the same server, 256 tokens:
 
-  The staggered TTFTs are the tell: with tools on, request *n* gets its first
-  token only after request *n-1* finishes. `llama-server` itself is blameless —
-  probing its internal port directly gives 48.0 tok/s for the same 3-way test,
-  matching the tools-off number exactly. The serialisation is entirely in the
-  tool layer above it.
+  | concurrent | tools on | tools off |
+  |---|---|---|
+  | 1 | 115.8 tok/s | 116.0 tok/s |
+  | 2 | 149.0 | 140.7 |
+  | 3 | 129.0 | 129.6 |
+  | 4 | 128.5 | 126.6 |
+  | 6 | 114.3 | 116.9 |
 
-  Single request, Qwen3.8-27B: 9.1 tok/s with tools, 32.7 without, 39.7 straight
-  to `llama-server`.
+  TTFT stayed at 0.1–0.4s up to the slot count in both arms (past it, the extra
+  requests wait for a slot either way), and a request that was running a web
+  search did not delay the plain requests beside it. If an upgrade brings the
+  old behaviour back, the tell is staggered TTFTs: request *n* gets its first
+  token only after request *n-1* finishes.
 
-  So pass `--no-tools` unless you specifically want server-side web search and
-  code execution. `start` warns when tools are on and `--parallel` is above 1,
-  because the slot count is otherwise a promise the server will not keep, and
-  the TUI asks outright. A client can opt out per request, but not with
-  `enable_tools: false`: a server started with tools on runs `--enable-tools`,
-  a policy that outranks the request field and forces the tool loop anyway.
-  Only `tool_choice: "none"` turns it off per request. A *streamed* request
-  that gets the forced loop without Studio's `X-Unsloth-Events: 1` confirm
-  channel is refused outright — HTTP 400 `confirm_tool_calls requires
-  stream=true and the X-Unsloth-Events: 1 header` — which is what broke `test`
-  and `benchmark` on tools-on servers until they started sending
-  `tool_choice: "none"`. Most OpenAI-compatible clients send neither field,
-  which is why the server-level flag is the one that matters. Verified: with the server started `--no-tools`, three
-  plain concurrent requests that send nothing special get TTFT 1.47s each and
-  50.0 tok/s aggregate.
+  On those older builds, a *streamed* request that got the forced loop without
+  Studio's `X-Unsloth-Events: 1` confirm channel was refused with HTTP 400
+  `confirm_tool_calls requires stream=true and the X-Unsloth-Events: 1 header`.
+  2026.10.3 no longer refuses it.
 
 - **Per-model overrides are keyed by quant, not by model.** The key is
   `<repo>:<variant>`, so which quant a launch picks silently decides which

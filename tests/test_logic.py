@@ -527,6 +527,92 @@ class TokenHistory(unittest.TestCase):
                 self.assertEqual(um._fmt_tokens(n), want)
 
 
+class LlamaKey(unittest.TestCase):
+    """Without the key, /slots and /metrics 401 and the live figures vanish."""
+
+    def test_key_file(self):
+        path = os.path.join(_ROOT, "llama_api_key_test")
+        with open(path, "w") as f:
+            f.write("sk-unsloth-abc\n")
+        argv = [b"llama-server", b"--port", b"5", b"--api-key-file",
+                path.encode(), b"--jinja"]
+        self.assertEqual(um._llama_key_from_argv(argv), "sk-unsloth-abc")
+
+    def test_inline_key(self):
+        self.assertEqual(um._llama_key_from_argv(
+            [b"llama-server", b"--api-key", b"k1"]), "k1")
+
+    def test_none_or_unreadable(self):
+        self.assertEqual(um._llama_key_from_argv([b"llama-server"]), "")
+        self.assertEqual(um._llama_key_from_argv(
+            [b"llama-server", b"--api-key-file", b"/nonexistent"]), "")
+        # A trailing flag with no value must not index past the end.
+        self.assertEqual(um._llama_key_from_argv(
+            [b"llama-server", b"--api-key-file"]), "")
+
+
+class HostSplit(unittest.TestCase):
+    """The CPU bar's unsloth/other split, and which sensor is the CPU's."""
+
+    @staticmethod
+    def _sample(busy, total, at, procs):
+        return {"busy": busy, "total": total, "at": at, "procs": procs}
+
+    def test_cpu_split_charges_only_the_window(self):
+        prev = self._sample(100, 1000, 500, {
+            1: (40, 10, 0, 0),        # ours throughout
+            2: (900, 20, 0, 0),       # pid recycled below: start differs
+        })
+        cur = self._sample(600, 2000, 600, {
+            1: (240, 10, 0, 0),       # +200
+            2: (30, 550, 0, 0),       # new process, started in the window
+            3: (5000, 30, 0, 0),      # old process that just became ours
+        })
+        busy, ours = um._cpu_split(prev, cur)
+        self.assertAlmostEqual(busy, 50.0)
+        self.assertAlmostEqual(ours, 23.0)
+
+    def test_cpu_split_never_exceeds_busy_or_runs_backwards(self):
+        prev = self._sample(0, 100, 0, {})
+        cur = self._sample(10, 200, 50, {1: (500, 10, 0, 0)})
+        self.assertEqual(um._cpu_split(prev, cur), (10.0, 10.0))
+        self.assertIsNone(um._cpu_split(cur, cur))
+
+    def _hwmon(self, chips):
+        root = tempfile.mkdtemp(dir=_ROOT)
+        for i, (name, temps) in enumerate(chips):
+            d = os.path.join(root, f"hwmon{i}")
+            os.makedirs(d)
+            with open(os.path.join(d, "name"), "w") as f:
+                f.write(name + "\n")
+            for j, (label, milli) in enumerate(temps, 1):
+                with open(os.path.join(d, f"temp{j}_input"), "w") as f:
+                    f.write(f"{milli}\n")
+                with open(os.path.join(d, f"temp{j}_label"), "w") as f:
+                    f.write(label + "\n")
+        return root
+
+    def test_cpu_temp_prefers_tdie_and_ignores_other_sensors(self):
+        # Two-die Threadripper 2: Tctl carries a 27°C offset; the NVMe and
+        # amdgpu readings are not the CPU at all.
+        root = self._hwmon([
+            ("nvme", [("Composite", 95000)]),
+            ("amdgpu", [("edge", 99000)]),
+            ("k10temp", [("Tctl", 61375), ("Tdie", 34375), ("Tccd1", 56750)]),
+            ("k10temp", [("Tctl", 70000), ("Tdie", 43000)]),
+        ])
+        self.assertAlmostEqual(um._cpu_temp_c(root), 43.0)
+
+    def test_cpu_temp_intel_package_and_none(self):
+        root = self._hwmon([
+            ("coretemp", [("Package id 0", 51000), ("Core 0", 58000)]),
+            ("coretemp", [("Package id 1", 47000)]),
+        ])
+        self.assertAlmostEqual(um._cpu_temp_c(root), 51.0)
+        self.assertIsNone(um._cpu_temp_c(self._hwmon([("nvme", [("C", 1)])])))
+        self.assertIsNone(um._cpu_temp_c(os.path.join(_ROOT, "absent")))
+
+
 class Isolation(unittest.TestCase):
     def test_nothing_points_at_the_real_box(self):
         for path in (um.STATE_DIR, um.LOG_DIR, um.STUDIO_DB, um.TOKENS_FILE):
