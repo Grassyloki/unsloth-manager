@@ -57,6 +57,7 @@ CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
 - [How servers are launched](#how-servers-are-launched)
 - [Gotchas worth knowing](#gotchas-worth-knowing)
 - [Connecting clients](#connecting-clients)
+- [Updating](#updating)
 - [Notes for this box](#notes-for-this-box)
 - [Tests](#tests)
 - [History](#history)
@@ -353,6 +354,7 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | `test <model>` | One streaming prompt, with TTFT and tok/s. |
 | `benchmark [<model>]` | Steady-state tok/s: a running server as it is, every running server, or a preset sweep on fresh loads — see [Benchmark](#benchmark). |
 | `doctor` | Check the host can serve before anything is launched. |
+| `update [check\|apply]` | Check this checkout's git upstream for a newer manager, and fast-forward to it — see [Updating](#updating). |
 
 ### `start` options
 
@@ -425,7 +427,9 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 
 ### The TUI
 
-`python unsloth_manager.py` with no arguments. The menu:
+`python unsloth_manager.py` with no arguments. The title carries the version,
+which is the commit the checkout is on (`f710f43 · 2026-10-26`). There are no
+release numbers. `modified` is added when tracked files have local edits. The menu:
 
 | Entry | |
 |---|---|
@@ -441,6 +445,7 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | **View Logs** | Tail a server log. |
 | **Studio Presets** | What the Studio UI has saved. |
 | **Environment Check** | `doctor`. |
+| **Check for Updates** | `update check`. If the check finds new commits, the entry turns into **Update (N new)**; choosing it applies them and restarts the menu on the new code. |
 
 Above the menu, each GPU gets one live line, then one for the CPU and one for
 RAM and swap, all refreshed with the rest of the header and laid out like
@@ -1439,6 +1444,44 @@ curl -s http://gpubox.example.com:10001/v1/models -H "Authorization: Bearer $KEY
 `/v1` is a base URL, not a GET-able path; health checks should hit
 `/api/health` (no token) or `/v1/models` (token required).
 
+## Updating
+
+The manager updates itself from its own git upstream, which is
+`origin/main` (`github.com/Grassyloki/unsloth-manager`) for a normal clone:
+
+```bash
+python unsloth_manager.py update         # fetch, and list what is new
+python unsloth_manager.py update apply   # fetch, list, and fast-forward to it
+```
+
+In the TUI, **Check for Updates** does the first. Nothing is checked unless
+you ask. When a check finds new commits, the entry reads **Update (N new)**,
+and choosing it applies exactly the commits that check listed, even if more
+have been pushed since. The menu then restarts itself on the new code.
+
+What an update can and cannot touch:
+
+- **Settings are never in the repository.** `local.env` and
+  `.api_tester.json` are git-ignored. `state.json`, `groups.json`,
+  `tokens.json` and the logs live in `STATE_DIR` and `LOG_DIR`, outside the
+  checkout. Studio's own settings are in `studio.db`. A pull changes code and
+  nothing else. If `local.env.example` changed, the update says so, because
+  that is where a new setting would be documented.
+- **Fast-forward only.** If the checkout has commits of its own, or edits to
+  tracked files, the update says which and does nothing. It never merges,
+  stashes or resets. Untracked files are left alone, and git refuses an
+  update that would overwrite one.
+- **Running servers keep running.** They are separate processes and keep
+  the code and command line they started with. New launch logic applies from
+  their next start. The same goes for keep-warm pingers. The boot unit runs
+  the script by path, so it picks up the new code at the next boot.
+- **Reversible.** The update prints the commit it came from, and
+  `git reset --keep <that>` goes back.
+
+`git` runs with `GIT_TERMINAL_PROMPT=0`, so a remote that wants a password
+fails with git's own error instead of hanging the TUI on a prompt nobody can
+see. The repository is public, so nothing needs one.
+
 ## Notes for this box
 
 - The GGUF quant is the main VRAM lever. `list --variants` shows each quant's
@@ -1485,6 +1528,9 @@ a wrong number, not the plumbing:
   quants.
 - **Throughput and token history.** The steady-rate window, and the
   hour→day rollup, pruning and windowed totals behind the token line.
+- **Updating.** Against a throwaway local upstream: a fast-forward leaves
+  `local.env` alone, applies only what the check saw, and refuses a checkout
+  with local commits or edited tracked files.
 
 Every setting is pointed at a throwaway directory before the manager is
 imported: state, logs and `studio.db`, and `UNSLOTH_MGR_ENV_FILE` is set to

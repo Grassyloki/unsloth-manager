@@ -4415,6 +4415,189 @@ def cmd_settings(args):
 
 
 # =============================================================================
+# UPDATE
+# =============================================================================
+# The checkout updates itself from its own git upstream (origin/main here).
+# Nothing a machine owns is in the repository: local.env and .api_tester.json
+# are git-ignored, and state, groups, tokens and logs live in STATE_DIR and
+# LOG_DIR -- so a fast-forward replaces code and nothing else.
+#
+# Only ever a fast-forward. A checkout with commits of its own, or with edits
+# to tracked files, is reported and left alone: never merged over, stashed or
+# reset. Running servers are separate processes and keep running on what they
+# were launched with; new launch logic applies from their next start.
+
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+UPDATE_FETCH_TIMEOUT = 60
+
+
+class _GitError(Exception):
+    pass
+
+
+def _git(*args: str, timeout: float = 15) -> subprocess.CompletedProcess:
+    # Never a credential prompt: inside the TUI it would wait on a terminal
+    # nobody can see. A private remote needs a credential helper or ssh key.
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    return subprocess.run(["git", "-C", REPO_DIR, *args], capture_output=True,
+                          text=True, timeout=timeout, env=env)
+
+
+def _git_out(*args: str, timeout: float = 15) -> str:
+    """stdout of a git command that has to succeed, else _GitError."""
+    try:
+        res = _git(*args, timeout=timeout)
+    except FileNotFoundError:
+        raise _GitError("git is not installed") from None
+    except subprocess.TimeoutExpired:
+        raise _GitError(f"`git {args[0]}` timed out after {timeout:.0f}s") \
+            from None
+    if res.returncode:
+        raise _GitError((res.stderr or res.stdout).strip()
+                        or f"`git {' '.join(args)}` failed")
+    return res.stdout.strip()
+
+
+def _update_check(fetch: bool = True) -> dict:
+    """Where this checkout stands against its upstream.
+
+    Never raises: a failure comes back as `error`, so the TUI can show it.
+    `target` is the upstream commit the check saw, which is what an apply
+    moves to -- not whatever the upstream has become since.
+    """
+    info = {"error": "", "branch": "", "upstream": "", "head": "",
+            "head_date": "", "target": "", "ahead": 0, "behind": 0,
+            "commits": [], "dirty": [], "files": []}
+    try:
+        _git_out("rev-parse", "--is-inside-work-tree")
+        info["branch"] = _git_out("rev-parse", "--abbrev-ref", "HEAD")
+        try:
+            info["upstream"] = _git_out("rev-parse", "--abbrev-ref",
+                                        "--symbolic-full-name", "@{u}")
+        except _GitError:
+            raise _GitError(
+                f"branch {info['branch']!r} has no upstream to update from; "
+                f"set one with `git -C {REPO_DIR} branch -u origin/main`"
+            ) from None
+        if fetch:
+            _git_out("fetch", "--quiet", timeout=UPDATE_FETCH_TIMEOUT)
+        info["head"], info["head_date"] = _git_out(
+            "log", "-1", "--format=%h %cs").split(" ", 1)
+        info["target"] = _git_out("rev-parse", "@{u}")
+        ahead, behind = _git_out("rev-list", "--left-right", "--count",
+                                 "HEAD...@{u}").split()
+        info["ahead"], info["behind"] = int(ahead), int(behind)
+        if info["behind"]:
+            log = _git_out("log", "--format=%h %cs %s", "HEAD..@{u}")
+            info["commits"] = log.splitlines()
+            info["files"] = _git_out("diff", "--name-only", "HEAD",
+                                     "@{u}").splitlines()
+        # Staged or not. Untracked files are ours to ignore; git itself
+        # refuses a merge that would overwrite one.
+        info["dirty"] = _git_out("diff", "--name-only", "HEAD").splitlines()
+    except _GitError as e:
+        info["error"] = str(e)
+    return info
+
+
+def _manager_version() -> str:
+    """The commit this checkout runs, e.g. "f710f43 · 2026-10-26".
+
+    There are no release numbers; the commit is the version. "modified" when
+    tracked files differ from it, and "" outside a git checkout.
+    """
+    try:
+        ver = _git_out("log", "-1", "--format=%h · %cs")
+        if _git_out("diff", "--name-only", "HEAD"):
+            ver += " · modified"
+    except _GitError:
+        return ""
+    return ver
+
+
+def _update_blocker(info: dict) -> str:
+    """Why `info` cannot be fast-forwarded, or "" if it can."""
+    if info["error"]:
+        return info["error"]
+    if info["ahead"]:
+        return (f"this checkout has {info['ahead']} commit(s) that "
+                f"{info['upstream']} does not; reconcile them with git by hand")
+    if info["dirty"]:
+        return ("tracked files have local edits: "
+                + ", ".join(info["dirty"])
+                + "; commit or `git stash` them first")
+    return ""
+
+
+def _print_update_check(info: dict) -> None:
+    print(f"\n  Update — {REPO_DIR}\n")
+    if info["error"]:
+        print(f"    {info['error']}\n")
+        return
+    print(f"    branch    : {info['branch']} → {info['upstream']}")
+    print(f"    this copy : {info['head']} ({info['head_date']})")
+    if not info["behind"]:
+        print(f"    upstream  : nothing new"
+              + (f"; this copy is {info['ahead']} commit(s) ahead"
+                 if info["ahead"] else "") + "\n")
+        return
+    print(f"    upstream  : {info['behind']} new commit(s)\n")
+    for line in info["commits"]:
+        print(f"      {line}")
+    blocker = _update_blocker(info)
+    print()
+    if blocker:
+        print(f"  Cannot update: {blocker}\n")
+
+
+def _update_apply(info: dict) -> bool:
+    """Fast-forward to the commit `info` saw. True on success."""
+    # The working tree may have changed since the check; ask again, offline.
+    now = _update_check(fetch=False)
+    blocker = _update_blocker(now) or (
+        "" if now["head"] == info["head"] else
+        f"the checkout moved to {now['head']} since the check; check again")
+    if blocker:
+        print(f"  Cannot update: {blocker}\n")
+        return False
+    try:
+        _git_out("merge", "--ff-only", "--quiet", info["target"])
+        new = _git_out("log", "-1", "--format=%h")
+    except _GitError as e:
+        print(f"  Update failed: {e}\n")
+        return False
+    print(f"  Updated {info['head']} → {new}.\n")
+    print("    local.env, state, groups, tokens and logs were not touched.")
+    if "local.env.example" in info["files"]:
+        print("    local.env.example changed: compare it with local.env for "
+              "new settings.")
+    if _get_running():
+        print("    Running servers keep running on the code they were "
+              "started with.")
+    print(f"    To go back: git -C {REPO_DIR} reset --keep {info['head']}\n")
+    return True
+
+
+def cmd_update(args):
+    """Check the git upstream for a newer manager, and fast-forward to it."""
+    print(f"\n  Fetching {REPO_DIR} ...", flush=True)
+    info = _update_check()
+    _print_update_check(info)
+    if info["error"]:
+        sys.exit(1)
+    if not info["behind"]:
+        return
+    if _update_blocker(info):
+        sys.exit(1)
+    if args.action == "check":
+        print(f"  Apply with: python {os.path.abspath(__file__)} update "
+              f"apply\n")
+        return
+    if not _update_apply(info):
+        sys.exit(1)
+
+
+# =============================================================================
 # TUI
 # =============================================================================
 
@@ -5948,6 +6131,47 @@ def _tui_act_api_tester(stdscr):
     tui.shell_out(stdscr, ["bash", script])
 
 
+def _tui_act_update(stdscr, pending: dict):
+    """Check for an update; once a check has found one, apply it.
+
+    `pending` is the menu's memory of that check -- what turns the entry from
+    "Check for Updates" into "Update". Only ever checked on request.
+    """
+    import curses
+    info = pending.get("info")
+    if not info:
+        def _check():
+            print(f"  Fetching {REPO_DIR} ...", flush=True)
+            found = _update_check()
+            _print_update_check(found)
+            if found["behind"] and not found["error"]:
+                pending["info"] = found
+                print("  The menu entry now reads Update; choose it to "
+                      "apply.")
+        tui.run_cmd(stdscr, _check)
+        return
+
+    curses.endwin()
+    _print_update_check(info)
+    try:
+        ok = _update_apply(info)
+    except KeyboardInterrupt:
+        print("\n  Interrupted.")
+        ok = False
+    pending.clear()
+    try:
+        input("Press Enter to restart the manager on the new version ..."
+              if ok else "\nPress Enter to continue ...")
+    except (EOFError, KeyboardInterrupt):
+        print()
+    if ok:
+        # This process still runs the old code; start the menu over on the
+        # new. Servers, keep-warm pingers and state are separate and carry on.
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+    stdscr.touchwin()
+    stdscr.refresh()
+
+
 def _tui_main(stdscr):
     import curses
 
@@ -5964,6 +6188,9 @@ def _tui_main(stdscr):
     # How many menu rows must stay visible whatever else is on screen.
     _MENU_MIN_ROWS = 6
 
+    # The last update check, while it found something to apply.
+    pending_update: dict = {}
+
     MENU_ACTIONS = [
         ("Start Model",     _tui_act_start),
         ("Instance Groups", _tui_act_groups),
@@ -5977,10 +6204,15 @@ def _tui_main(stdscr):
         ("View Logs",       _tui_act_logs),
         ("Studio Presets",  _tui_act_presets),
         ("Environment Check", _tui_act_doctor),
+        ("Check for Updates", lambda s: _tui_act_update(s, pending_update)),
         ("Quit",            None),
     ]
+    update_idx = len(MENU_ACTIONS) - 2
 
     refresh_ms = 5000
+    # Read once: an update restarts the menu, so this is always what runs.
+    version = _manager_version()
+    title = "Unsloth Service Manager" + (f"   {version}" if version else "")
 
     def _build_header():
         running = _get_running()
@@ -6151,11 +6383,15 @@ def _tui_main(stdscr):
         header = _build_header()
         menu_items = [(label, 0) for label, _ in MENU_ACTIONS]
         menu_items[-1] = ("Quit", curses.A_DIM)
+        if pending_update.get("info"):
+            menu_items[update_idx] = (
+                f"Update ({pending_update['info']['behind']} new)",
+                curses.color_pair(_C_GREEN) | curses.A_BOLD)
 
         def _refresh():
             return _build_header(), menu_items
 
-        idx = tui.select(stdscr, "Unsloth Service Manager", menu_items,
+        idx = tui.select(stdscr, title, menu_items,
                          header=header, refresh_cb=_refresh,
                          refresh_ms=refresh_ms)
 
@@ -6401,6 +6637,13 @@ Override with --api-key or UNSLOTH_MGR_API_KEY.
 
     sp = sub.add_parser("doctor", help="check the host can serve")
     sp.set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser("update",
+                        help="check git for a newer manager, and update to it")
+    sp.add_argument("action", nargs="?", default="check",
+                    choices=("check", "apply"),
+                    help="default: check. `apply` fast-forwards to upstream")
+    sp.set_defaults(func=cmd_update)
 
     args = p.parse_args()
 

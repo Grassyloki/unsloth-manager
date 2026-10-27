@@ -13,12 +13,16 @@ import argparse
 import contextlib
 import copy
 import json
+import io
 import os
+import shutil
 import sqlite3
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _TMP = tempfile.TemporaryDirectory(prefix="unsloth-mgr-tests-")
 _ROOT = _TMP.name
@@ -744,6 +748,102 @@ class Autostart(unittest.TestCase):
         self.assertIn("RemainAfterExit=yes", text)
         self.assertIn(um.HF_HOME, text)
         self.assertEqual(um.AUTOSTART_UNIT, "unsloth-manager.service")
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class Update(unittest.TestCase):
+    """Against a throwaway upstream: a local path stands in for GitHub."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(dir=_ROOT)
+        self.up = os.path.join(self.tmp, "up.git")
+        self.dev = os.path.join(self.tmp, "dev")
+        self.copy = os.path.join(self.tmp, "copy")
+        self._git(self.tmp, "init", "-q", "--bare", "-b", "main", self.up)
+        self._git(self.tmp, "clone", "-q", self.up, self.dev)
+        self._commit(self.dev, {".gitignore": "local.env\n", "app.py": "v1\n",
+                                "local.env.example": "#A=\n"})
+        self._git(self.tmp, "clone", "-q", self.up, self.copy)
+        with open(os.path.join(self.copy, "local.env"), "w") as f:
+            f.write("UNSLOTH_MGR_PUBLIC_HOST=mine\n")
+        patch = mock.patch.object(um, "REPO_DIR", self.copy)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _git(cwd, *args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                        "-c", "commit.gpgsign=false", *args], cwd=cwd,
+                       check=True, capture_output=True)
+
+    def _commit(self, repo, files, push=True):
+        for name, text in files.items():
+            with open(os.path.join(repo, name), "w") as f:
+                f.write(text)
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-q", "-m", f"edit {', '.join(files)}")
+        if push:
+            self._git(repo, "push", "-q", "origin", "main")
+
+    def _read(self, name):
+        with open(os.path.join(self.copy, name)) as f:
+            return f.read()
+
+    def _apply(self, info):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            return um._update_apply(info), out.getvalue()
+
+    def test_up_to_date(self):
+        info = um._update_check()
+        self.assertEqual((info["error"], info["behind"]), ("", 0))
+        self.assertEqual(info["upstream"], "origin/main")
+
+    def test_fast_forward_keeps_local_settings(self):
+        self._commit(self.dev, {"app.py": "v2\n", "local.env.example": "#B=\n"})
+        info = um._update_check()
+        self.assertEqual(info["behind"], 1)
+        self.assertEqual(um._update_blocker(info), "")
+        ok, out = self._apply(info)
+        self.assertTrue(ok, out)
+        self.assertEqual(self._read("app.py"), "v2\n")
+        self.assertEqual(self._read("local.env"),
+                         "UNSLOTH_MGR_PUBLIC_HOST=mine\n")
+        self.assertIn("local.env.example changed", out)
+        self.assertEqual(um._update_check()["behind"], 0)
+
+    def test_applies_only_what_the_check_saw(self):
+        self._commit(self.dev, {"app.py": "v2\n"})
+        info = um._update_check()
+        self._commit(self.dev, {"app.py": "v3\n"})
+        um._git_out("fetch", "--quiet")
+        self.assertTrue(self._apply(info)[0])
+        self.assertEqual(self._read("app.py"), "v2\n")
+
+    def test_edited_tracked_file_blocks(self):
+        self._commit(self.dev, {"app.py": "v2\n"})
+        with open(os.path.join(self.copy, "app.py"), "w") as f:
+            f.write("hand edit\n")
+        info = um._update_check()
+        self.assertIn("app.py", um._update_blocker(info))
+        self.assertFalse(self._apply(info)[0])
+        self.assertEqual(self._read("app.py"), "hand edit\n")
+
+    def test_local_commit_blocks(self):
+        self._commit(self.dev, {"app.py": "v2\n"})
+        self._commit(self.copy, {"mine.py": "x\n"}, push=False)
+        info = um._update_check()
+        self.assertEqual((info["ahead"], info["behind"]), (1, 1))
+        self.assertIn("1 commit(s)", um._update_blocker(info))
+        self.assertFalse(self._apply(info)[0])
+
+    def test_no_upstream_is_an_error_not_a_crash(self):
+        self._git(self.copy, "checkout", "-q", "-b", "side")
+        self.assertIn("no upstream", um._update_check()["error"])
+        with mock.patch.object(um, "REPO_DIR", self.tmp):
+            self.assertTrue(um._update_check()["error"])
 
 
 class Isolation(unittest.TestCase):
