@@ -10,10 +10,12 @@ box's local.env, bank into the real tokens.json, or open the real studio.db.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
 import os
 import sqlite3
+import struct
 import sys
 import tempfile
 import unittest
@@ -37,8 +39,15 @@ HOUR, DAY = 3600, 86400
 
 
 def _studio_db(idle: int | None = None, presets: list | None = None,
-               overrides: dict | None = None) -> None:
-    """(Re)write the throwaway studio.db with just the rows the code reads."""
+               overrides: dict | None = None,
+               auto_switch: bool | None = None) -> None:
+    """(Re)write the throwaway studio.db with just the rows the code reads.
+
+    A stored idle TTL only runs with auto-switch on, so `idle` turns it on
+    unless the test says otherwise.
+    """
+    if auto_switch is None and idle is not None:
+        auto_switch = True
     path = um.STUDIO_DB
     if os.path.exists(path):
         os.remove(path)
@@ -46,6 +55,7 @@ def _studio_db(idle: int | None = None, presets: list | None = None,
     for table in ("app_settings", "chat_settings"):
         conn.execute(f"create table {table} (key text primary key, value_json text)")
     rows = [("app_settings", up.IDLE_UNLOAD_KEY, idle),
+            ("app_settings", up.AUTO_SWITCH_KEY, auto_switch),
             ("app_settings", up.OVERRIDES_KEY, overrides),
             ("chat_settings", up.PRESETS_KEY, presets)]
     for table, key, val in rows:
@@ -124,6 +134,87 @@ class VariantNaming(unittest.TestCase):
         with tempfile.TemporaryDirectory() as snap:
             _touch(os.path.join(snap, "model.safetensors"))
             self.assertEqual(ml._scan_snapshot(snap), ("hf", {}))
+
+
+def _gguf(path: str, kvs: list) -> str:
+    """A GGUF that is all header: (key, value) pairs, str -> STRING, int ->
+    UINT32, list of str -> ARRAY of STRING."""
+    def _s(v):
+        b = v.encode()
+        return struct.pack("<Q", len(b)) + b
+    body = b""
+    for key, val in kvs:
+        body += _s(key)
+        if isinstance(val, str):
+            body += struct.pack("<I", 8) + _s(val)
+        elif isinstance(val, int):
+            body += struct.pack("<II", 4, val)
+        else:
+            body += (struct.pack("<IIQ", 9, 8, len(val))
+                     + b"".join(_s(x) for x in val))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<IIQQ", 0x46554747, 3, 0, len(kvs)) + body)
+    return path
+
+
+class GgufHeader(unittest.TestCase):
+    KVS = [("general.architecture", "qwen35moe"),
+           ("tokenizer.ggml.tokens", ["a", "b"]),
+           ("qwen35moe.context_length", 262144),
+           ("general.file_type", 15)]
+
+    def test_context_and_quant(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = _gguf(os.path.join(d, "M.gguf"), self.KVS)
+            self.assertEqual(ml.gguf_native_context(p), 262144)
+            self.assertEqual(ml.gguf_quant(p), "Q4_K_M")
+
+    def test_absent_or_garbage(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = _gguf(os.path.join(d, "M.gguf"), self.KVS[:2])
+            self.assertIsNone(ml.gguf_native_context(p))
+            self.assertEqual(ml.gguf_quant(p), "")
+            junk = _touch(os.path.join(d, "J.gguf"), 64)
+            self.assertIsNone(ml.gguf_native_context(junk))
+            self.assertEqual(ml.gguf_quant(junk), "")
+
+    def test_quant_label(self):
+        """A tag in the name wins; a name without one shows the header's
+        quant, not the tail of the filename."""
+        with tempfile.TemporaryDirectory() as snap:
+            _gguf(os.path.join(snap, "Model-25G-ICE.gguf"), self.KVS)
+            _gguf(os.path.join(snap, "Model-Q8_0.gguf"), self.KVS)
+            _touch(os.path.join(snap, "Plain.gguf"), 64)
+            m = _model(snap, "gguf")
+            m.variants = ml._scan_snapshot(snap)[1]
+            self.assertEqual(ml.quant_label(m, "Model-25G-ICE"), "Q4_K_M")
+            self.assertEqual(ml.quant_label(m, "Q8_0"), "Q8_0")
+            self.assertEqual(ml.quant_label(m, "Plain"), "Plain")
+            self.assertEqual(ml.quant_label(m, "dir/UD-Q4_K_XL"), "UD-Q4_K_XL")
+            self.assertEqual(ml.quant_label(None, "Model-25G-ICE"),
+                             "Model-25G-ICE")
+            self.assertEqual(ml.quant_label(m, ""), "")
+
+
+# =============================================================================
+# Idle unload: the stored TTL only runs while auto-switch is on
+# =============================================================================
+
+class IdleUnload(unittest.TestCase):
+    def test_gated_on_auto_switch(self):
+        _studio_db(idle=300)
+        self.assertEqual(up.idle_unload_seconds(um.STUDIO_DB), 300)
+        _studio_db(idle=300, auto_switch=False)
+        self.assertEqual(up.idle_unload_seconds(um.STUDIO_DB), 0)
+        _studio_db(idle=30)
+        self.assertEqual(up.idle_unload_seconds(um.STUDIO_DB), 60)
+        _studio_db(auto_switch=True)
+        self.assertEqual(up.idle_unload_seconds(um.STUDIO_DB), 0)
+
+    def test_auto_switch_off_by_default(self):
+        _studio_db()
+        self.assertFalse(up.auto_switch_enabled(um.STUDIO_DB))
 
 
 # =============================================================================
@@ -611,6 +702,48 @@ class HostSplit(unittest.TestCase):
         self.assertAlmostEqual(um._cpu_temp_c(root), 51.0)
         self.assertIsNone(um._cpu_temp_c(self._hwmon([("nvme", [("C", 1)])])))
         self.assertIsNone(um._cpu_temp_c(os.path.join(_ROOT, "absent")))
+
+
+class Autostart(unittest.TestCase):
+    def setUp(self):
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(um.GROUPS_FILE)
+
+    def test_boot_mark_survives_save_and_clear(self):
+        um._save_groups({"10": {"name": "pre-update", "members": []}})
+        um._set_boot_slot(10)
+        self.assertEqual(um._boot_slot(), 10)
+        um._save_groups({})
+        self.assertEqual(um._boot_slot(), 10)
+        um._set_boot_slot(0)
+        self.assertEqual(um._boot_slot(), 0)
+        with open(um.GROUPS_FILE) as f:
+            self.assertNotIn("boot", json.load(f))
+
+    def test_out_of_range_mark_is_ignored(self):
+        um._write_groups({}, um.GROUP_SLOTS + 1)
+        self.assertEqual(um._boot_slot(), 0)
+
+    def test_server_from_before_boot_is_dead(self):
+        # Our own pid is alive, but a start before the last boot means the
+        # pid is a reused one, not the server.
+        booted = um._boot_time()
+        self.assertGreater(booted, 0)
+        state = {"models": {
+            "org/Old": {"pid": os.getpid(), "started": booted - 60},
+            "org/New": {"pid": os.getpid(), "started": booted + 60},
+        }}
+        state, dead = um._prune_dead(state)
+        self.assertEqual(dead, ["org/Old"])
+        self.assertIn("org/New", state["models"])
+
+    def test_unit_runs_the_mark_and_spares_servers(self):
+        text = um._autostart_unit_text()
+        self.assertIn("autostart run", text)
+        self.assertIn("KillMode=process", text)
+        self.assertIn("RemainAfterExit=yes", text)
+        self.assertIn(um.HF_HOME, text)
+        self.assertEqual(um.AUTOSTART_UNIT, "unsloth-manager.service")
 
 
 class Isolation(unittest.TestCase):

@@ -708,12 +708,32 @@ IDLE_UNLOAD_KEY = "openai_api_auto_unload_idle_seconds"
 MIN_IDLE_UNLOAD_SECONDS = 60
 
 
+AUTO_SWITCH_KEY = "openai_api_auto_switch_model"
+
+
+def auto_switch_enabled(studio_db: str) -> bool:
+    """Whether a /v1 request may load a model other than the resident one.
+
+    Off is Studio's default. Studio stores the flag as JSON, so a bool, but
+    coerces strings too; mirror that rather than read "false" as truthy.
+    """
+    raw = _read_setting(studio_db, "app_settings", AUTO_SWITCH_KEY)
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return raw is True
+
+
 def idle_unload_seconds(studio_db: str) -> int:
     """Effective idle-unload TTL in seconds; 0 when off.
 
     Enabled values have a 60s floor, matching Studio: a tiny TTL tears the
-    model down between turns of an active chat.
+    model down between turns of an active chat. And a stored TTL only runs
+    while auto-switch is on (get_auto_unload_idle_seconds): with it off
+    Studio neither unloads an idle model nor reloads one on request, so the
+    300s still saved in studio.db means nothing until auto-switch is back.
     """
+    if not auto_switch_enabled(studio_db):
+        return 0
     raw = _read_setting(studio_db, "app_settings", IDLE_UNLOAD_KEY)
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return 0

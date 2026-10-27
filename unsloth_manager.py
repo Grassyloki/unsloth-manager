@@ -331,6 +331,23 @@ def _profile_label(entry: dict) -> str:
     return f"{load} + sampling {sampling}"
 
 
+_QUANT_LABELS: dict[tuple[str, str], str] = {}
+
+
+def _quant_label(repo_id: str, variant: str) -> str:
+    """The quant a running server's variant is, for the dashboard column.
+
+    Cached for the life of the process: it means a cache scan and a header
+    read, the dashboard asks every refresh, and a variant's file does not
+    change quant under a running server.
+    """
+    key = (repo_id, variant)
+    if key not in _QUANT_LABELS:
+        m = ml.find_model(HF_HOME, repo_id) if variant else None
+        _QUANT_LABELS[key] = ml.quant_label(m, variant)
+    return _QUANT_LABELS[key]
+
+
 def _fmt_uptime(started: float) -> str:
     secs = max(0, int(time.time() - started))
     h, rem = divmod(secs, 3600)
@@ -368,10 +385,29 @@ def _save_state(state: dict):
     os.replace(tmp, STATE_FILE)
 
 
+def _boot_time() -> float:
+    """When this kernel booted, from /proc/stat (0 if unreadable)."""
+    try:
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
 def _prune_dead(state: dict) -> tuple[dict, list[str]]:
-    """Drop entries whose process is gone, so `status` never lies."""
+    """Drop entries whose process is gone, so `status` never lies.
+
+    A server started before the last boot is gone whatever its pid says: after
+    a reboot the pid is free to belong to anything, and trusting it would make
+    a boot-time restore skip that model as "already running".
+    """
+    booted = _boot_time()
     dead = [name for name, e in state["models"].items()
-            if not _pid_alive(int(e.get("pid", 0)))]
+            if not _pid_alive(int(e.get("pid", 0)))
+            or float(e.get("started") or 0) < booted]
     for name in dead:
         state["models"].pop(name, None)
     if dead:
@@ -600,22 +636,45 @@ def _launch_namespace(member: dict) -> argparse.Namespace:
     return argparse.Namespace(**ns)
 
 
-def _load_groups() -> dict:
+def _load_groups_doc() -> dict:
     try:
         with open(GROUPS_FILE) as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
-    slots = data.get("slots")
+    return data if isinstance(data, dict) else {}
+
+
+def _load_groups() -> dict:
+    slots = _load_groups_doc().get("slots")
     return slots if isinstance(slots, dict) else {}
 
 
-def _save_groups(slots: dict):
+def _boot_slot() -> int:
+    """The slot marked to start at boot, or 0 for none."""
+    slot = _load_groups_doc().get("boot")
+    return slot if isinstance(slot, int) and 1 <= slot <= GROUP_SLOTS else 0
+
+
+def _write_groups(slots: dict, boot: int):
     _ensure_dirs()
+    doc = {"slots": slots}
+    if boot:
+        doc["boot"] = boot
     tmp = GROUPS_FILE + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"slots": slots}, f, indent=2)
+        json.dump(doc, f, indent=2)
     os.replace(tmp, GROUPS_FILE)
+
+
+def _save_groups(slots: dict):
+    # The boot mark belongs to the slot NUMBER, not its contents, so it
+    # survives a re-save or a clear of that slot.
+    _write_groups(slots, _boot_slot())
+
+
+def _set_boot_slot(slot: int):
+    _write_groups(_load_groups(), slot)
 
 
 def _check_slot(slot: int) -> int:
@@ -1553,6 +1612,12 @@ def _print_effective(port: int, log_path: str, api_key: str = "",
                   f"after {mins} idle.")
             print(f"                 The next /v1 request reloads it; VRAM is "
                   f"free until then.")
+        elif not up.auto_switch_enabled(STUDIO_DB):
+            # Auto-switch off also stops the reload, so a model freed before
+            # it was turned off stays gone: every /v1 request answers 400.
+            print("    state      : no model loaded, and with Model auto-switch "
+                  "off nothing\n                 reloads it on request. "
+                  "`restart` this server to load it again.")
         else:
             print("    state      : no model loaded (and idle auto-unload is "
                   "off, so something\n                 unloaded it "
@@ -2832,6 +2897,10 @@ def cmd_doctor(args):
                   "UNSLOTH_MGR_HF_TOKEN" if HF_TOKEN else "")
     print(f"    hf token      : "
           f"{f'set via {hf_src}' if hf_src else 'not set (public repos only)'}")
+    boot = _boot_slot()
+    print(f"    autostart     : "
+          + (f"slot {boot}, unit {_autostart_unit_state()}" if boot
+             else "off"))
 
     print("\n  " + ("All checks passed." if ok else "Some checks failed.") + "\n")
     if not ok:
@@ -4042,6 +4111,10 @@ def cmd_groups(args):
         del slots[key]
         _save_groups(slots)
         print(f"\n  Cleared slot {slot} ({name}).\n")
+        if slot == _boot_slot():
+            print(f"  Slot {slot} is still the boot slot, so the next boot "
+                  f"starts nothing until\n  something is saved to it. "
+                  f"`autostart off` drops the mark.\n")
         return
 
     if action == "show":
@@ -4096,14 +4169,15 @@ def cmd_groups(args):
         for mem in members:
             print(f"    {mem['model']}")
             print(f"      {_fmt_member(mem)}")
-        print(f"\n  Restore after a reboot with:\n")
+        print(f"\n  Restore it with:\n")
         print(f"    {_group_cli('restore', slot)}\n")
-        print(f"  As a systemd unit (After=network-online.target, "
-              f"Type=oneshot):\n")
-        print(f"    ExecStart={_group_cli('restore', slot)}\n")
-        print(f"  Or from cron:\n")
-        print(f"    @reboot {_group_cli('restore', slot)} "
-              f">> {LOG_DIR}/group-restore.log 2>&1\n")
+        if slot == _boot_slot():
+            print(f"  Slot {slot} is the boot slot: this is what the next boot "
+                  f"starts.\n")
+        else:
+            print(f"  Start it at every boot with:\n")
+            print(f"    python {os.path.abspath(__file__)} autostart set "
+                  f"{slot}\n")
         return
 
     if action == "restore":
@@ -4124,7 +4198,7 @@ def cmd_groups(args):
         for mem in members:
             name = mem.get("model", "")
             if name in running:
-                # Idempotent on purpose: a @reboot cron that fires twice, or a
+                # Idempotent on purpose: a boot restore that fires twice, or a
                 # service restarted by hand, must not try to double-start.
                 print(f"  - {name}: already running; skipping.")
                 skipped.append(name)
@@ -4153,6 +4227,138 @@ def cmd_groups(args):
         return
 
     _die(f"unknown groups action {action!r}")
+
+
+# =============================================================================
+# AUTOSTART
+# =============================================================================
+# One group slot can be marked as the boot slot; a systemd unit restores it at
+# every boot. The mark lives in groups.json, not in the unit, so pointing boot
+# at another slot -- or re-saving the slot before an update -- never means
+# rewriting the unit: it always runs `autostart run`, which reads the mark.
+#
+# The servers a restore starts live in the unit's cgroup. KillMode=process is
+# what keeps them alive: the unit's own process is the restore, which exits
+# once every model has loaded, and stopping, restarting or failing the unit
+# must not take the servers down with it. Type=simple so a ten-minute load
+# never holds up the rest of the boot.
+
+AUTOSTART_UNIT = "unsloth-manager.service"
+AUTOSTART_UNIT_PATH = os.path.join("/etc/systemd/system", AUTOSTART_UNIT)
+
+
+def _autostart_unit_text() -> str:
+    mounts = " ".join(p for p in (HF_HOME, STATE_DIR, LOG_DIR) if p)
+    return f"""[Unit]
+Description=unsloth-manager: start the boot instance group
+Wants=network-online.target
+After=network-online.target nvidia-persistenced.service
+RequiresMountsFor={mounts}
+
+[Service]
+Type=simple
+RemainAfterExit=yes
+KillMode=process
+ExecStart={sys.executable} {os.path.abspath(__file__)} autostart run
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def _systemctl(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["systemctl", *args], capture_output=True,
+                          text=True)
+
+
+def _autostart_unit_state() -> str:
+    """enabled / disabled / not installed, as `systemctl` sees the unit."""
+    if not os.path.isfile(AUTOSTART_UNIT_PATH):
+        return "not installed"
+    if not _has_command("systemctl"):
+        return "installed (systemctl not found)"
+    return _systemctl("is-enabled", AUTOSTART_UNIT).stdout.strip() or "unknown"
+
+
+def cmd_autostart(args):
+    """Mark a group slot to start at boot, and install the unit that does it."""
+    action = args.action
+    slots = _load_groups()
+    boot = _boot_slot()
+
+    if action == "status":
+        print("\n  Autostart\n")
+        if boot:
+            g = slots.get(str(boot))
+            what = (f"{g.get('name') or '(unnamed)'}, "
+                    f"{len(g.get('members', []))} model(s)" if g else "EMPTY")
+            print(f"    boot slot : {boot} ({what})")
+        else:
+            print("    boot slot : none")
+        print(f"    unit      : {AUTOSTART_UNIT_PATH} "
+              f"[{_autostart_unit_state()}]")
+        if os.path.isfile(AUTOSTART_UNIT_PATH) and _has_command("systemctl"):
+            res = _systemctl("show", AUTOSTART_UNIT, "--value",
+                             "-p", "ActiveState", "-p", "Result")
+            act, _, result = res.stdout.strip().partition("\n")
+            print(f"    this boot : {act or '?'} ({result or '?'})"
+                  f"   journalctl -u {AUTOSTART_UNIT}")
+        print(f"\n  Set with: python {os.path.abspath(__file__)} autostart "
+              f"set <slot>\n")
+        return
+
+    if action == "set":
+        slot = _check_slot(args.slot)
+        if str(slot) not in slots:
+            # Allowed: a slot reserved for "whatever I saved last" may be
+            # set up before anything is in it. Say so rather than refuse.
+            print(f"\n  Note: slot {slot} is empty; boot starts nothing until "
+                  f"`groups save {slot}`.")
+        if not _has_command("systemctl"):
+            _die("systemctl not found; autostart needs systemd")
+        _set_boot_slot(slot)
+        with open(AUTOSTART_UNIT_PATH, "w") as f:
+            f.write(_autostart_unit_text())
+        for cmd in (("daemon-reload",), ("enable", AUTOSTART_UNIT)):
+            res = _systemctl(*cmd)
+            if res.returncode:
+                _die(f"systemctl {' '.join(cmd)} failed: "
+                     f"{(res.stderr or res.stdout).strip()}")
+        g = slots.get(str(slot)) or {}
+        print(f"\n  Slot {slot} ({g.get('name') or 'empty'}) now starts at "
+              f"boot.")
+        print(f"    unit : {AUTOSTART_UNIT_PATH} [enabled]")
+        print(f"    log  : journalctl -u {AUTOSTART_UNIT}\n")
+        print("  Nothing was started now. Re-saving the slot changes what boot "
+              "starts;\n  no need to set it again.\n")
+        return
+
+    if action == "off":
+        if os.path.isfile(AUTOSTART_UNIT_PATH) and _has_command("systemctl"):
+            # Stopping the unit is safe for the servers (KillMode=process);
+            # it only clears its "active (exited)" state.
+            _systemctl("disable", "--now", AUTOSTART_UNIT)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(AUTOSTART_UNIT_PATH)
+        if _has_command("systemctl"):
+            _systemctl("daemon-reload")
+        _set_boot_slot(0)
+        print(f"\n  Autostart is off"
+              + (f" (slot {boot} keeps its group)." if boot else ".")
+              + " Running servers were not touched.\n")
+        return
+
+    if action == "run":
+        if not boot:
+            print("\n  No boot slot is set; nothing to start.\n")
+            return
+        if str(boot) not in slots:
+            _die(f"boot slot {boot} is empty; nothing to start")
+        cmd_groups(argparse.Namespace(action="restore", slot=boot, name="",
+                                      wait=args.wait))
+        return
+
+    _die(f"unknown autostart action {action!r}")
 
 
 def cmd_settings(args):
@@ -5567,17 +5773,19 @@ def _tui_group_items():
     """(label, attr) per slot, for the group menu."""
     import curses
     slots = _load_groups()
+    boot = _boot_slot()
     items = []
     for n in range(1, GROUP_SLOTS + 1):
         g = slots.get(str(n))
+        tag = "  [boot]" if n == boot else ""
         if not g:
-            items.append((f"  {n:>2}. (empty)", curses.color_pair(_C_DIM)))
+            items.append((f"  {n:>2}. (empty){tag}", curses.color_pair(_C_DIM)))
             continue
         when = time.strftime("%m-%d %H:%M", time.localtime(g.get("saved", 0)))
         members = g.get("members", [])
         ports = ",".join(str(m.get("port")) for m in members if m.get("port"))
         items.append((f"  {n:>2}. {(g.get('name') or 'unnamed')[:24]:<26}"
-                      f"{len(members)} model(s)  :{ports:<14}{when}",
+                      f"{len(members)} model(s)  :{ports:<14}{when}{tag}",
                       curses.color_pair(_C_GREEN)))
     return items
 
@@ -5589,19 +5797,30 @@ def _tui_act_groups(stdscr):
         actions = [("  Restore a group  (start everything it holds)", 0),
                    ("  Save the running servers to a slot", 0),
                    ("  Show a group's saved answers", 0),
-                   ("  Clear a slot", 0)]
+                   ("  Clear a slot", 0),
+                   ("  Start a slot at boot", 0),
+                   ("  Turn autostart off", 0)]
+        boot = _boot_slot()
         header = [("A group remembers every answer a launch was given —",
                    curses.color_pair(_C_DIM)),
                   ("model, quant, port, GPUs, profile, sampling and tools —",
                    curses.color_pair(_C_DIM)),
                   ("so a reboot can be undone with one command.",
-                   curses.color_pair(_C_DIM))]
+                   curses.color_pair(_C_DIM)),
+                  (f"Boot slot: {boot or 'none'}  "
+                   f"({AUTOSTART_UNIT} {_autostart_unit_state()})",
+                   curses.color_pair(_C_GREEN if boot else _C_DIM))]
         choice = tui.select(stdscr, "Instance groups", actions, header=header)
         if choice < 0:
             return
+        if choice == 5:
+            tui.run_cmd(stdscr, cmd_autostart, argparse.Namespace(
+                action="off", slot=0, wait=None))
+            continue
 
         titles = ("Restore which group?", "Save to which slot?",
-                  "Show which group?", "Clear which slot?")
+                  "Show which group?", "Clear which slot?",
+                  "Start which slot at boot?")
         idx = tui.select(stdscr, titles[choice], _tui_group_items())
         if idx < 0:
             continue
@@ -5617,9 +5836,12 @@ def _tui_act_groups(stdscr):
         elif choice == 2:
             tui.run_cmd(stdscr, cmd_groups, argparse.Namespace(
                 action="show", slot=slot, name="", wait=None))
-        else:
+        elif choice == 3:
             tui.run_cmd(stdscr, cmd_groups, argparse.Namespace(
                 action="clear", slot=slot, name="", wait=None))
+        else:
+            tui.run_cmd(stdscr, cmd_autostart, argparse.Namespace(
+                action="set", slot=slot, wait=None))
 
 
 def _tui_act_stop(stdscr):
@@ -5811,15 +6033,15 @@ def _tui_main(stdscr):
             def _short(n):
                 return n.split("/")[-1]
 
-            def _quant(e):
-                q = e.get("variant") or "-"
-                # A quant can be "dir/TAG" for a quant-per-folder repo; the tag
-                # is the identifying half, so keep that end when it is long.
+            def _quant(n, e):
+                q = _quant_label(n, e.get("variant") or "") or "-"
+                # Whatever is left unrecognised keeps its end when long, the
+                # half a quant-per-folder "dir/TAG" would have its tag in.
                 return q[-12:] if len(q) > 12 else q
 
             namew = min(30, max(14, max((len(_short(n)) for n, _ in shown),
                                         default=14)))
-            quantw = min(12, max(4, max((len(_quant(e)) for _, e in shown),
+            quantw = min(12, max(4, max((len(_quant(n, e)) for n, e in shown),
                                         default=4)))
             for name, entry in shown:
                 ready = _probe_ready(int(entry["port"]),
@@ -5827,7 +6049,7 @@ def _tui_main(stdscr):
                 dattr = (curses.color_pair(_C_GREEN if ready else _C_CYAN)
                          | curses.A_BOLD)
                 short = _short(name)
-                quant = _quant(entry)
+                quant = _quant(name, entry)
                 line = [
                     ("  ", 0),
                     ("●", dattr),
@@ -6003,6 +6225,18 @@ Override with --api-key or UNSLOTH_MGR_API_KEY.
                          "(0 = don't wait)")
     sp.set_defaults(func=cmd_groups)
 
+    sp = sub.add_parser("autostart",
+                        help="start a group slot at every boot")
+    sp.add_argument("action", nargs="?", default="status",
+                    choices=("status", "set", "off", "run"),
+                    help="default: status. `run` is what the unit calls")
+    sp.add_argument("slot", nargs="?", type=int, default=0,
+                    help=f"slot number for `set`, 1-{GROUP_SLOTS}")
+    sp.add_argument("--wait", type=int,
+                    help="seconds to wait per model on `run` "
+                         "(0 = don't wait)")
+    sp.set_defaults(func=cmd_autostart)
+
     sp = sub.add_parser("settings",
                         help="what every source says about a model")
     sp.add_argument("model")
@@ -6173,6 +6407,9 @@ Override with --api-key or UNSLOTH_MGR_API_KEY.
     if getattr(args, "cmd", "") == "groups" and args.action != "list" \
             and not args.slot:
         p.error(f"groups {args.action} needs a slot number (1-{GROUP_SLOTS})")
+    if getattr(args, "cmd", "") == "autostart" and args.action == "set" \
+            and not args.slot:
+        p.error(f"autostart set needs a slot number (1-{GROUP_SLOTS})")
 
     if not args.cmd:
         tui.launch(_tui_main)

@@ -50,6 +50,7 @@ CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
 - [Reading settings back after a load](#reading-settings-back-after-a-load)
 - [Tokens churned](#tokens-churned)
 - [Instance groups](#instance-groups)
+  - [Starting a group at boot](#starting-a-group-at-boot)
 - [Ports and instance limit](#ports-and-instance-limit)
 - [API keys](#api-keys)
 - [Benchmark](#benchmark)
@@ -67,7 +68,7 @@ CachyOS (Arch), serving GGUF models out of a shared Hugging Face cache.
 |------|---------|
 | `unsloth_manager.py` | Main entry point: TUI + CLI to start, stop, inspect, test and benchmark servers. |
 | `unsloth_profiles.py` | Every source of "how should this model run": published guides, Unsloth's shipped defaults, Studio presets, per-model overrides — plus the payload shapes for saving an edit back to the last two. |
-| `model_lib.py` | HF-cache scanning, GGUF variant detection, VRAM fit estimation, native context length. |
+| `model_lib.py` | HF-cache scanning, GGUF variant detection, VRAM fit estimation, native context length and quant from the GGUF header. |
 | `tui_lib.py` | Shared curses widgets (selector, prompts, coloured bars, screen plumbing). |
 | `api_tester.sh` | Interactive whiptail client for poking any OpenAI-compatible endpoint. |
 | `local.env.example` | Template for `local.env`, the git-ignored per-machine settings file. |
@@ -238,7 +239,11 @@ The quant sits beside the model because it is half of what identifies a
 running server — and because per-model overrides are keyed `<repo>:<variant>`,
 it is also what decided the settings on the line below. Both columns size
 themselves to what is actually on screen, so short names leave more room for
-the settings; a quant-per-folder variant keeps its tag end (`M/UD-Q4_K_XL`).
+the settings. The column shows the quant, not the variant id: a quant-per-folder
+variant shows its tag (`UD-Q4_K_XL`), and a file whose name carries no tag at
+all (`…-MTPv2-25G-ICE.gguf`, whose variant id is the whole stem) shows the quant
+its GGUF header records (`Q4_K_M`). `status` and `settings` still print the full
+variant, since that is the id overrides are keyed by.
 
 It adapts rather than bloating. On a short terminal each server collapses to
 one line and every value still at a default is dropped; on a narrow one the
@@ -296,6 +301,7 @@ Or use the CLI:
 python unsloth_manager.py groups                          # the 10 instance-group slots
 python unsloth_manager.py groups save <slot> [--name N]   # snapshot what is running
 python unsloth_manager.py groups restore <slot>           # bring it all back
+python unsloth_manager.py autostart set <slot>            # start that slot at every boot
 python unsloth_manager.py settings <model>                # every settings source, side by side
 python unsloth_manager.py presets                         # what the Studio UI has saved
 python unsloth_manager.py list [--variants]               # cached models, GGUF quants, VRAM fit
@@ -341,6 +347,7 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | `settings <model>` | All four settings sources side by side, plus live state if it is running. |
 | `presets` | Studio presets from `studio.db`, read-only. |
 | `groups [list\|save\|restore\|show\|clear] [slot]` | Instance groups — see [Instance groups](#instance-groups). |
+| `autostart [status\|set\|off\|run] [slot]` | Start one group slot at every boot — see [Starting a group at boot](#starting-a-group-at-boot). |
 | `keepalive <model>` | Ping a server so Studio never idle-unloads it — see [Keeping a server warm](#keeping-a-server-warm). |
 | `logs <model> [-n N] [-f]` | Tail a server log. |
 | `test <model>` | One streaming prompt, with TTFT and tok/s. |
@@ -411,7 +418,7 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | `benchmark --gpus` / `--variant` | Sweep only: placement and quant, held constant across runs. |
 | `settings --variant Q` | Which quant's profile to look up (default: best that fits). |
 | `groups --name "..."` | Label for a saved group. |
-| `groups --wait N` | Seconds to wait per model on restore (`0` = don't wait). |
+| `groups --wait N` / `autostart --wait N` | Seconds to wait per model on restore (`0` = don't wait). |
 | `restart --preset` / `--port` / `--gpus` / `--variant` / `--tools` / `--keep-warm` / `--wait` | Change one thing; everything else is kept. |
 | `keepalive --interval N` / `--api-key` | Ping period (default: half the idle TTL) and token. |
 | `test --api-key` / `benchmark --api-key` / `settings --api-key` | Bearer token. Default: read from the server's own log. |
@@ -423,7 +430,7 @@ Everything the CLI exposes. `--help` on any subcommand prints the same thing.
 | Entry | |
 |---|---|
 | **Start Model** | model → quant → profile → review (edit, and optionally save back) → tools → idle behaviour → port → GPUs, then the launch plan. |
-| **Instance Groups** | Restore / save / show / clear the ten slots. |
+| **Instance Groups** | Restore / save / show / clear the ten slots, and pick the one that starts at boot (marked `[boot]`). |
 | **Model Settings** | `settings` for one model. |
 | **Stop Model** | Stop one running server. |
 | **Status** | Full `status` output. |
@@ -777,8 +784,10 @@ you are getting, and the post-load readout says what the server settled on:
 ## Idle auto-unload, and what a reload restores
 
 Studio frees a GGUF after `openai_api_auto_unload_idle_seconds` of inactivity
-and reloads it on the next `/v1` request. This is on for this box (300s), and
-it has a consequence worth stating plainly:
+and reloads it on the next `/v1` request — but only while Model auto-switch is
+on (see [Keeping a server warm](#keeping-a-server-warm)). This box has 300s
+saved but auto-switch off since 2026-10-26, so nothing here idle-unloads now.
+When it is on, it has a consequence worth stating plainly:
 
 > **A reload does not replay the command line the manager launched with.** It
 > rebuilds a `LoadRequest` from the per-model override in `studio.db`
@@ -851,6 +860,14 @@ state      : idle-unloaded — Unsloth freed the weights after 5m idle.
              The next /v1 request reloads it; VRAM is free until then.
 ```
 
+With Model auto-switch off, the readout says the server is stuck instead
+(see the next section):
+
+```
+state      : no model loaded, and with Model auto-switch off nothing
+             reloads it on request. `restart` this server to load it again.
+```
+
 ## Keeping a server warm
 
 Studio's idle unload is **global**. `openai_api_auto_unload_idle_seconds`,
@@ -859,6 +876,24 @@ Studio's idle unload is **global**. `openai_api_auto_unload_idle_seconds`,
 environment override — so "don't unload *this* one" cannot be expressed through
 Unsloth's settings at all. (The manager writes back to Studio only to save a
 profile you edited at launch; a global unload policy is not that.)
+
+**The idle TTL only runs while Model auto-switch is on** (Settings > API,
+`openai_api_auto_switch_model`). Studio gates the stored TTL on it
+(`get_auto_unload_idle_seconds`), so with auto-switch off:
+
+- nothing ever idle-unloads: models stay resident and hold their VRAM, no idle
+  reload ever rebuilds one from `studio.db`, and keep-warm has nothing to do
+  (the manager reads the TTL as 0 and says so);
+- a `/v1` request naming another cached model gets a 404 ("downloaded but not
+  loaded, and 'Switch model by request' is off") instead of swapping it in —
+  `/v1/models` still *lists* every cached model and quant, though; and
+- **a model that was already idle-unloaded when the toggle went off is not
+  reloaded by a request either** — the port answers `400 No model loaded`
+  until you `restart` it. Restart every idle server right after turning
+  auto-switch off.
+
+The 300s stays saved and comes back into force when auto-switch is turned on.
+This box runs with auto-switch off since 2026-10-26.
 
 It is done from outside instead. `start --keep-warm` (and the TUI's **Idle
 behaviour** step) launches a small detached process that pings that one server
@@ -1013,24 +1048,17 @@ python unsloth_manager.py groups show 1     # every saved answer
 python unsloth_manager.py groups clear 1
 ```
 
-Saving prints the restore command, plus the systemd and cron lines, so the
-service is copy-pasteable:
-
-```
-Restore after a reboot with:
-    python /root/unsloth-manager/unsloth_manager.py groups restore 1
-
-As a systemd unit (After=network-online.target, Type=oneshot):
-    ExecStart=python /root/unsloth-manager/unsloth_manager.py groups restore 1
-
-Or from cron:
-    @reboot python /root/unsloth-manager/unsloth_manager.py groups restore 1 >> /root/.unsloth-logs/group-restore.log 2>&1
-```
+Saving prints the restore command, and the `autostart set` line that would
+start the slot at every boot (see [below](#starting-a-group-at-boot)).
 
 Four things make it safe to run unattended:
 
-- **Idempotent.** A model already running is skipped, so a `@reboot` job that
+- **Idempotent.** A model already running is skipped, so a restore that
   fires twice, or a service restarted by hand, does nothing the second time.
+  "Running" means a live pid *started since the last boot*: after a reboot
+  `state.json` still names the old pids, any of which may now belong to an
+  unrelated process, so an entry older than the kernel's boot time counts as
+  dead whatever its pid says.
 - **Partial failure is survivable.** One member failing does not abandon the
   rest; the summary names what failed and the exit status is 1, so a service
   reports the failure without having lost the models that did come up.
@@ -1060,6 +1088,65 @@ The same answers are what `restart` replays, explicit flags included: a
 saved into, an `--extra`. A value that `--save-profile` wrote back is dropped
 from the answers once the save lands, so from then on it comes from the profile
 like everything else.
+
+### Starting a group at boot
+
+One slot can be marked as the boot slot. A systemd unit,
+`unsloth-manager.service`, restores it at every boot:
+
+```bash
+python unsloth_manager.py autostart set 10   # mark slot 10, install + enable the unit
+python unsloth_manager.py autostart          # boot slot, unit state, how this boot's run went
+python unsloth_manager.py autostart off      # disable + remove the unit, drop the mark
+journalctl -u unsloth-manager                # the restore's output
+```
+
+The mark lives in `groups.json`, **not** in the unit. The unit always runs
+`autostart run`, which reads the mark and restores that slot. So what boot
+starts is whatever the slot holds *at boot*: re-save the slot (say, a
+"pre-update" snapshot taken before upgrading Studio) and the next boot follows
+it, with nothing to reinstall. The mark belongs to the slot number. `groups
+clear` on the boot slot keeps the mark, and warns that the next boot will start
+nothing until something is saved there.
+
+`set` does not start anything now; it only arranges the next boot. The unit is:
+
+```ini
+[Unit]
+Wants=network-online.target
+After=network-online.target nvidia-persistenced.service
+RequiresMountsFor=<HF_HOME> <STATE_DIR> <LOG_DIR>
+
+[Service]
+Type=simple
+RemainAfterExit=yes
+KillMode=process
+ExecStart=<python> /root/unsloth-manager/unsloth_manager.py autostart run
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Three lines are load-bearing:
+
+- **`KillMode=process`.** The servers the restore starts live in the unit's
+  cgroup. The unit's own process is the restore, which exits once every model
+  has loaded. Under the default `control-group` mode, stopping, restarting or
+  failing the unit would take every server down with it. With `process`, it
+  only ever signals the restore itself. `autostart off` stops the unit and
+  leaves the running servers alone.
+- **`Type=simple`** rather than `oneshot`. A oneshot wanted by
+  `multi-user.target` holds up the boot until it exits, which here means every
+  model's load, at up to `LOAD_TIMEOUT` each. `simple` lets the boot finish
+  while models load. A failed member still marks the unit `failed`, since the
+  restore exits 1.
+- **`RequiresMountsFor`.** The HF cache on this box is on `/mnt/stor1`. A
+  restore that ran before the mount came up would find no weights and fail
+  every member.
+
+The TUI's **Instance Groups** screen has the same actions (**Start a slot at
+boot**, **Turn autostart off**). It shows the boot slot in its header and tags
+it `[boot]` in the slot list.
 
 ## Ports and instance limit
 

@@ -294,9 +294,10 @@ def suggest_variant(m: ModelInfo, per_gpu_gb: int, n_gpus: int) -> str:
 # GGUF HEADER
 # =============================================================================
 # Just enough of the GGUF key/value block to read a model's native context
-# length, which is what "max context" means before any VRAM capping. Unsloth
-# reads the same key ({arch}.context_length) the same way; this is a local
-# copy so a readout does not need a running server to answer the question.
+# length, which is what "max context" means before any VRAM capping, and the
+# quant it was made with. Unsloth reads the same key ({arch}.context_length)
+# the same way; this is a local copy so a readout does not need a running
+# server to answer the question.
 
 _GGUF_MAGIC = 0x46554747          # b"GGUF" as a little-endian u32
 
@@ -343,53 +344,93 @@ def _gguf_skip(f, vtype: int) -> bool:
     return False
 
 
-def gguf_native_context(path: str) -> int | None:
-    """`{arch}.context_length` from a GGUF header, or None.
+def _gguf_scalars(path: str, pick) -> dict:
+    """Integer and string values from a GGUF header.
 
-    The architecture is learned from general.architecture, which GGUF writes
-    before the arch-namespaced keys, so one forward pass is enough. Returns
-    None for a non-GGUF, an unreadable file, or a zero/absent value — a real
-    context length is positive, and treating garbage as a length would publish
-    a window no fitter ever agreed to.
+    `pick(key, arch)` returns None to skip a key, else whether it is the last
+    key wanted, which ends the read there. `arch` is general.architecture,
+    always collected because GGUF writes it before the arch-namespaced keys
+    that need it, so one forward pass is enough. A malformed or unreadable
+    file yields whatever was read before it went wrong -- often nothing --
+    rather than resyncing onto whatever bytes come next.
     """
-    arch = None
+    out: dict = {}
     try:
         with open(path, "rb") as f:
             head = f.read(24)
             if len(head) < 24:
-                return None
+                return out
             magic, _version, _tensors, kv_count = struct.unpack("<IIQQ", head)
             if magic != _GGUF_MAGIC:
-                return None
+                return out
             for _ in range(kv_count):
                 raw = f.read(8)
                 if len(raw) < 8:
-                    return None
+                    return out
                 klen = struct.unpack("<Q", raw)[0]
                 if klen > 1 << 20:
-                    return None
+                    return out
                 key = f.read(klen).decode("utf-8", "replace")
                 raw = f.read(4)
                 if len(raw) < 4:
-                    return None
+                    return out
                 vtype = struct.unpack("<I", raw)[0]
 
-                if vtype == 8 and key == "general.architecture":
+                want = pick(key, out.get("general.architecture"))
+                if key == "general.architecture" and want is None:
+                    want = False
+                if want is not None and vtype == 8:
                     n = struct.unpack("<Q", f.read(8))[0]
                     if n > 1 << 22:
-                        return None
-                    arch = f.read(n).decode("utf-8", "replace")
-                elif (arch and vtype in (4, 10)
-                      and key == f"{arch}.context_length"):
+                        return out
+                    out[key] = f.read(n).decode("utf-8", "replace")
+                elif want is not None and vtype in (4, 10):
                     width = 4 if vtype == 4 else 8
-                    val = struct.unpack("<I" if vtype == 4 else "<Q",
-                                        f.read(width))[0]
-                    return val if val > 0 else None
+                    out[key] = struct.unpack("<I" if vtype == 4 else "<Q",
+                                             f.read(width))[0]
                 elif not _gguf_skip(f, vtype):
-                    return None
+                    return out
+                else:
+                    continue
+                if want:
+                    return out
     except (OSError, struct.error, UnicodeDecodeError):
-        return None
-    return None
+        pass
+    return out
+
+
+def gguf_native_context(path: str) -> int | None:
+    """`{arch}.context_length` from a GGUF header, or None.
+
+    None for a non-GGUF, an unreadable file, or a zero/absent value -- a real
+    context length is positive, and treating garbage as a length would
+    publish a window no fitter ever agreed to.
+    """
+    vals = _gguf_scalars(path, lambda key, arch: (
+        True if arch and key == f"{arch}.context_length" else None))
+    val = vals.get(f"{vals.get('general.architecture')}.context_length", 0)
+    return val if isinstance(val, int) and val > 0 else None
+
+
+# llama.cpp's llama_ftype, as written to general.file_type: the quant a
+# GGUF was made with, whatever its filename says. Only the codes that name
+# one quant; 33-35 were the retired Q4_0_4_x repacks.
+_GGUF_FTYPE = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0",
+    9: "Q5_1", 10: "Q2_K", 11: "Q3_K_S", 12: "Q3_K_M", 13: "Q3_K_L",
+    14: "Q4_K_S", 15: "Q4_K_M", 16: "Q5_K_S", 17: "Q5_K_M", 18: "Q6_K",
+    19: "IQ2_XXS", 20: "IQ2_XS", 21: "Q2_K_S", 22: "IQ3_XS", 23: "IQ3_XXS",
+    24: "IQ1_S", 25: "IQ4_NL", 26: "IQ3_S", 27: "IQ3_M", 28: "IQ2_S",
+    29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16", 36: "TQ1_0",
+    37: "TQ2_0", 38: "MXFP4_MOE",
+}
+
+
+def gguf_quant(path: str) -> str:
+    """The quant a GGUF header records (general.file_type), or ""."""
+    vals = _gguf_scalars(
+        path, lambda key, _arch: True if key == "general.file_type" else None)
+    return _GGUF_FTYPE.get(vals.get("general.file_type", -1), "")
 
 
 def variant_gguf_path(m: ModelInfo, variant: str) -> str:
@@ -414,6 +455,21 @@ def native_context(m: ModelInfo, variant: str = "") -> int | None:
             if path:
                 break
     return gguf_native_context(path) if path else None
+
+
+def quant_label(m: ModelInfo | None, variant: str) -> str:
+    """The quant to show for `variant`: its tag when the name carries one,
+    else what the GGUF header records, else the variant name itself.
+
+    A repo whose file is named `Model-25G-ICE.gguf` has no tag to parse, so
+    its variant is the whole stem -- right as an id (it is what Studio keys
+    the override by), useless as a label: cut to a column it reads as noise.
+    """
+    tag = os.path.basename(variant)
+    if not variant or _QUANT_DIR_RE.match(tag):
+        return tag
+    path = variant_gguf_path(m, variant) if m else ""
+    return (gguf_quant(path) if path else "") or tag
 
 
 _MMPROJ_RE = re.compile(r"^mmproj|-mmproj", re.IGNORECASE)
